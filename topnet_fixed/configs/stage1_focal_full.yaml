@@ -1,0 +1,32 @@
+# Experiment C: Full-supervision Focal Loss (all pixels)
+# python train_stage1.py --config configs/stage1_focal_full.yaml
+
+data_dir: "./data/data"
+checkpoint_dir: "./checkpoints/expC_focal_full"
+log_dir: "./logs/expC_focal_full/stage1"
+
+model_type: "ObPlaNet_resnet18_keypoint"
+freeze_encoders: true
+
+data_type: "gaussian"
+image_size: 256
+batch_size: 32
+num_workers: 4
+
+epochs: 10
+optimizer: "adamw"
+lr: 1.0e-4
+weight_decay: 1.0e-4
+
+loss: "focal"
+focal_alpha: 2.0
+focal_beta: 4.0
+gaussian_sigma_factor: 6.0
+focal_full_supervision: true
+
+patience: 8
+early_stop_metric: "val_loss"
+early_stop_delta: 1.0e-4
+
+print_freq: 100
+tensorboard: true

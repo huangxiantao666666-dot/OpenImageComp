@@ -1,0 +1,29 @@
+# Experiment A: Sparse CrossEntropy (baseline)
+# python train_stage1.py --config configs/stage1_ce.yaml
+
+data_dir: "./data/data"
+checkpoint_dir: "./checkpoints/expA_ce"
+log_dir: "./logs/expA_ce/stage1"
+
+model_type: "ObPlaNet_resnet18"
+freeze_encoders: true
+
+data_type: "sparse"
+image_size: 256
+batch_size: 32
+num_workers: 4
+
+epochs: 10
+optimizer: "adamw"
+lr: 1.0e-4
+weight_decay: 1.0e-4
+
+loss: "cross_entropy"
+loss_ignore_index: 255
+
+patience: 8
+early_stop_metric: "val_loss"
+early_stop_delta: 1.0e-4
+
+print_freq: 100
+tensorboard: true

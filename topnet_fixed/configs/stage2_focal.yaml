@@ -1,0 +1,33 @@
+# Experiment B: Partial Focal Loss (pos+neg regions only) - Stage 2
+# python train_stage2.py --config configs/stage2_focal.yaml
+
+data_dir: "./data/data"
+checkpoint_dir: "./checkpoints/expB_focal"
+log_dir: "./logs/expB_focal/stage2"
+stage1_ckpt: "./checkpoints/expB_focal/stage1_best.pth"
+
+model_type: "ObPlaNet_resnet18_keypoint"
+freeze_encoders: false
+
+data_type: "gaussian"
+image_size: 256
+batch_size: 32
+num_workers: 4
+
+epochs: 30
+optimizer: "adamw"
+lr: 1.0e-5
+weight_decay: 1.0e-4
+
+loss: "focal"
+focal_alpha: 2.0
+focal_beta: 4.0
+gaussian_sigma_factor: 6.0
+focal_full_supervision: false
+
+patience: 12
+early_stop_metric: "val_loss"
+early_stop_delta: 1.0e-4
+
+print_freq: 100
+tensorboard: true

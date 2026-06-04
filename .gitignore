@@ -1,0 +1,52 @@
+# Datasets
+data/
+dataset/
+**/data/data/
+
+# Model weights & checkpoints
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+*.safetensors
+IdentityLUT33.txt
+checkpoints/
+best_weight/
+pretrained_models/
+!**/checkpoints/.gitkeep
+!**/best_weight/.gitkeep
+
+# Datasets (all levels)
+OPA/dataset/
+**/data/data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs & outputs
+logs/
+outputs/
+*.log
+writer/
+
+# TensorBoard
+events.out.tfevents.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.swp
+*.swo
