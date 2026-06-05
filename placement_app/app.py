@@ -302,8 +302,9 @@ def analyze(bg_np: np.ndarray | None,
             fg_mask_np: np.ndarray | None,
             method: str,
             grid_size: float, n_scales: float,
-            topnet_scale: float,   # NEW: user-selected fg scale for TopNet
+            topnet_scale: float,
             use_harmony: bool,
+            mask_source: str = 'sam2',
             progress=gr.Progress()) -> tuple:
     """
     Args:
@@ -328,8 +329,8 @@ def analyze(bg_np: np.ndarray | None,
         if fg_mask_np is not None:
             fg_mask = Image.fromarray(fg_mask_np).convert('L')
         else:
-            # Auto-mask: Otsu + centre prior (no deep-learning dep needed)
-            mask_arr = auto_mask(fg_rgb_np)
+            # Auto-mask via selected source (SAM2 or OpenCV)
+            mask_arr = compute_mask(fg_rgb_np, mask_source, None)
             fg_mask = Image.fromarray(mask_arr).convert('L')
 
     candidates = []
@@ -487,6 +488,10 @@ def build_ui():
                                     choices=['topnet', 'grid'],
                                     value='topnet', label='Placement method',
                                     info='TopNet = single-pass heatmap; Grid = enumerate + SimOPA score')
+                                p_mask_src = gr.Radio(
+                                    choices=['sam2', 'opencv', 'alpha'],
+                                    value='alpha', label='Mask source',
+                                    info='SAM2 / OpenCV / alpha channel (presets have alpha)')
                                 p_tn_scale = gr.Slider(5, 100, value=30, step=5,
                                                         label='FG scale for TopNet (%)',
                                                         info='Foreground size as % of background')
@@ -526,7 +531,7 @@ def build_ui():
 
                     btn_p.click(analyze,
                                 [bg_st, fg_st, mk_st, p_method,
-                                 p_grid, p_scales, p_tn_scale, p_harmony],
+                                 p_grid, p_scales, p_tn_scale, p_harmony, p_mask_src],
                                 [hm_p, gal_p, tbl_p, status_p])
 
             # ---- Custom Upload ----
@@ -544,6 +549,10 @@ def build_ui():
                             u_method = gr.Radio(
                                 choices=['topnet', 'grid'],
                                 value='topnet', label='Placement method')
+                            u_mask_src = gr.Radio(
+                                choices=['sam2', 'opencv', 'alpha'],
+                                value='sam2', label='Mask source',
+                                info='SAM2 / OpenCV / alpha channel')
                             u_tn_scale = gr.Slider(5, 100, value=30, step=5,
                                                     label='FG scale for TopNet (%)')
                             u_grid = gr.Slider(3, 9, value=5, step=1,
@@ -570,7 +579,7 @@ def build_ui():
 
                 btn_u.click(analyze,
                             [u_bg, u_fg, u_mask, u_method,
-                             u_grid, u_scales, u_tn_scale, u_harmony],
+                             u_grid, u_scales, u_tn_scale, u_harmony, u_mask_src],
                             [hm_u, gal_u, tbl_u, status_u])
 
             # ============================================================
