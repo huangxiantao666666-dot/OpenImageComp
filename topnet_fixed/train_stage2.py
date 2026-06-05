@@ -12,6 +12,7 @@ import os, sys, time, json, argparse, yaml
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -42,16 +43,24 @@ def get_dataloaders_from_cfg(cfg):
     img_size   = cfg.get('image_size', 256)
     bs         = cfg.get('batch_size', 8)
     nw         = cfg.get('num_workers', 4)
+
+    # Validation: always sparse
+    from data.dataset import get_dataloaders as get_sparse
+    _, val_loader = get_sparse(train_json, test_json, bg_dir, fg_dir,
+                                img_size, bs, nw)
+
     if cfg.get('data_type') == 'gaussian':
         from data.dataset_gaussian import get_dataloaders_gaussian
         sf = cfg.get('gaussian_sigma_factor', 6.0)
         fs = cfg.get('focal_full_supervision', False)
-        return get_dataloaders_gaussian(train_json, test_json, bg_dir, fg_dir,
-                                         img_size, bs, nw, sf, fs)
+        train_loader, _ = get_dataloaders_gaussian(train_json, test_json,
+                                                     bg_dir, fg_dir,
+                                                     img_size, bs, nw, sf, fs)
     else:
-        from data.dataset import get_dataloaders
-        return get_dataloaders(train_json, test_json, bg_dir, fg_dir,
-                                img_size, bs, nw)
+        train_loader, _ = get_sparse(train_json, test_json, bg_dir, fg_dir,
+                                      img_size, bs, nw)
+
+    return train_loader, val_loader
 
 
 # ---- Metrics ----
@@ -80,7 +89,8 @@ def compute_metrics(logits, target, ignore_index=255):
     rec  = TP / max(TP + FN, 1)
     f1   = 2 * prec * rec / max(prec + rec, 1e-8)
     bAcc = 0.5 * (TP / max(TP + FN, 1) + TN / max(TN + FP, 1))
-    return {'f1': f1, 'bAcc': bAcc, 'prec': prec, 'rec': rec}
+    return {'f1': f1, 'bAcc': bAcc, 'prec': prec, 'rec': rec,
+            'TP': TP, 'TN': TN, 'FP': FP, 'FN': FN}
 
 
 # ---- Training / validation ----
@@ -110,16 +120,19 @@ def validate(model, loader, criterion, device, epoch, writer, is_gaussian):
     loss_m = AverageMeter()
     metrics = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
     for batch in tqdm(loader, desc='Valid', leave=False):
+        # Validation always uses sparse data (4 items), regardless of training type
+        bg, fg, mk, target = [b.to(device) for b in batch]
+        logits = model(bg, fg, mk)
+
         if is_gaussian:
-            bg, fg, mk, target, valid_mask = [b.to(device) for b in batch]
-            logits = model(bg, fg, mk)
-            loss = criterion(logits, target, valid_mask)
-            m = compute_metrics(logits, target)
+            ignore_mask = (target != 255)
+            pred_flat = logits.squeeze(1)[ignore_mask]
+            tgt_flat = target[ignore_mask].float()
+            loss = F.binary_cross_entropy(pred_flat, tgt_flat)
         else:
-            bg, fg, mk, target = [b.to(device) for b in batch]
-            logits = model(bg, fg, mk)
             loss = criterion(logits, target)
-            m = compute_metrics(logits, target, 255)
+
+        m = compute_metrics(logits, target, 255)
         loss_m.update(loss.item(), bg.size(0))
         for k in ['TP', 'TN', 'FP', 'FN']:
             metrics[k] += m[k]

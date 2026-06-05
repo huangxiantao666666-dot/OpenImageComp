@@ -16,6 +16,7 @@ import os, sys, time, json, argparse, yaml
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -44,6 +45,12 @@ def load_config(config_path, cli_overrides=None):
 #  Data loading
 # ======================================================================
 def get_dataloaders_from_cfg(cfg):
+    """Build train + val loaders.
+
+    Training uses the ``data_type`` specified in config (sparse / gaussian).
+    Validation ALWAYS uses sparse annotations so that F1/bAcc are comparable
+    across experiments.
+    """
     data_dir = cfg['data_dir']
     train_json = os.path.join(data_dir, 'train_pair_new.json')
     test_json  = os.path.join(data_dir, 'test_pair_new.json')
@@ -53,16 +60,24 @@ def get_dataloaders_from_cfg(cfg):
     bs         = cfg.get('batch_size', 8)
     nw         = cfg.get('num_workers', 4)
 
+    # Validation: always sparse
+    from data.dataset import get_dataloaders as get_sparse
+    _, val_loader = get_sparse(train_json, test_json, bg_dir, fg_dir,
+                                img_size, bs, nw)
+
+    # Training: config-driven
     if cfg.get('data_type') == 'gaussian':
         from data.dataset_gaussian import get_dataloaders_gaussian
         sf = cfg.get('gaussian_sigma_factor', 6.0)
         fs = cfg.get('focal_full_supervision', False)
-        return get_dataloaders_gaussian(train_json, test_json, bg_dir, fg_dir,
-                                         img_size, bs, nw, sf, fs)
+        train_loader, _ = get_dataloaders_gaussian(train_json, test_json,
+                                                     bg_dir, fg_dir,
+                                                     img_size, bs, nw, sf, fs)
     else:
-        from data.dataset import get_dataloaders
-        return get_dataloaders(train_json, test_json, bg_dir, fg_dir,
-                                img_size, bs, nw)
+        train_loader, _ = get_sparse(train_json, test_json, bg_dir, fg_dir,
+                                      img_size, bs, nw)
+
+    return train_loader, val_loader
 
 
 # ======================================================================
@@ -101,34 +116,126 @@ def compute_metrics(logits, target, ignore_index=255):
 # ======================================================================
 #  Encoder helpers
 # ======================================================================
-def load_sopa_encoder(model, sopa_path):
-    if not os.path.exists(sopa_path):
-        print(f'[WARN] SOPA weight not found: {sopa_path}. Training bg_encoder from scratch.')
-        return
-    state = torch.load(sopa_path, map_location='cpu')
-    if 'state_dict' in state:
-        state = state['state_dict']
-    state = {k.replace('module.', ''): v for k, v in state.items()}
-    bg_params = {}
-    for name in ['bg_encoder1', 'bg_encoder2', 'bg_encoder4',
-                 'bg_encoder8', 'bg_encoder16']:
-        for k, v in getattr(model, name).state_dict().items():
-            bg_params[f'{name}.{k}'] = v
+def _init_4ch_conv1(conv1):
+    """Greyscale-initialise the 4th channel from channels 0-2."""
+    weight = conv1.weight.data
+    for i in range(weight.size(0)):
+        weight[i, 3] = (0.299 * weight[i, 0] + 0.587 * weight[i, 1]
+                        + 0.114 * weight[i, 2])
+    conv1.weight.data = weight
+
+
+def _copy_imagenet_to_encoder(model, src_state):
+    """
+    Load ImageNet ResNet18 weights into both encoders.
+
+    Key mappings (ImageNet → our encoder keys):
+      conv1.weight          → bg_encoder1.0 / fg_encoder1.0  (3ch → 4ch partial)
+      bn1.{w,b,rm,rv,nbt}  → bg_encoder1.1 / fg_encoder1.1
+      layer1.*              → bg_encoder2.1.*  / fg_encoder2.1.*
+      layer2.*              → bg_encoder4.*    / fg_encoder4.*
+      layer3.*              → bg_encoder8.*    / fg_encoder8.*
+      layer4.*              → bg_encoder16.*   / fg_encoder16.*  (and 32 for fg)
+
+    conv1 is handled specially: channels 0-2 copied, channel 3 grey-init'd.
+    """
+    prefix_map = {
+        'bg_encoder1':  {'conv1': '0', 'bn1': '1'},
+        'bg_encoder2':  {'layer1': '1'},
+        'bg_encoder4':  {'layer2': ''},
+        'bg_encoder8':  {'layer3': ''},
+        'bg_encoder16': {'layer4': ''},
+        'fg_encoder1':  {'conv1': '0', 'bn1': '1'},
+        'fg_encoder2':  {'layer1': '1'},
+        'fg_encoder4':  {'layer2': ''},
+        'fg_encoder8':  {'layer3': ''},
+        'fg_encoder16': {'layer4': ''},
+        'fg_encoder32': {'layer4': ''},
+    }
+    for enc_name, mappings in prefix_map.items():
+        enc = getattr(model, enc_name)
+        enc_state = enc.state_dict()
+        for src_prefix, dst_prefix in mappings.items():
+            # Find all ImageNet keys starting with src_prefix
+            prefix_len = len(src_prefix)
+            for img_k, img_v in src_state.items():
+                if not img_k.startswith(src_prefix):
+                    continue
+                suffix = img_k[prefix_len:]  # e.g. '.0.conv1.weight' or '.weight'
+                if dst_prefix:
+                    dst_k = f'{dst_prefix}{suffix}'
+                else:
+                    dst_k = suffix.lstrip('.')
+                if dst_k in enc_state and enc_state[dst_k].shape == img_v.shape:
+                    enc_state[dst_k] = img_v.clone()
+        enc.load_state_dict(enc_state)
+
+    # conv1 4th channel (both encoders)
+    _init_4ch_conv1(model.bg_encoder1[0])
+    _init_4ch_conv1(model.fg_encoder1[0])
+
+
+def _copy_sopa_to_bg_encoder(model, sopa_state):
+    """
+    Load SOPA weights into bg_encoder.
+
+    SOPA.pth.tar keys are flat, matching the ResNet18 internal structure:
+      conv1.*  → bg_encoder1.0.*
+      bn1.*    → bg_encoder1.1.*
+      layer1.* → bg_encoder2.1.*
+      layer2.* → bg_encoder4.*
+      layer3.* → bg_encoder8.*
+      layer4.* → bg_encoder16.*
+      fc.*     → skip (classification head, not needed)
+    """
+    # Same prefix mapping as ImageNet
+    prefix_map = {
+        'bg_encoder1':  {'conv1': '0', 'bn1': '1'},
+        'bg_encoder2':  {'layer1': '1'},
+        'bg_encoder4':  {'layer2': ''},
+        'bg_encoder8':  {'layer3': ''},
+        'bg_encoder16': {'layer4': ''},
+    }
     loaded = 0
-    for k, v in bg_params.items():
-        if k in state and state[k].shape == v.shape:
-            bg_params[k] = state[k]; loaded += 1
-    model.load_state_dict(bg_params, strict=False)
+    for enc_name, mappings in prefix_map.items():
+        enc = getattr(model, enc_name)
+        enc_state = enc.state_dict()
+        for src_prefix, dst_prefix in mappings.items():
+            prefix_len = len(src_prefix)
+            for sopa_k, sopa_v in sopa_state.items():
+                if not sopa_k.startswith(src_prefix):
+                    continue
+                suffix = sopa_k[prefix_len:]  # e.g. '.0.conv1.weight'
+                if dst_prefix:
+                    dst_k = f'{dst_prefix}{suffix}'
+                else:
+                    dst_k = suffix.lstrip('.')
+                if dst_k in enc_state and enc_state[dst_k].shape == sopa_v.shape:
+                    enc_state[dst_k] = sopa_v.clone()
+                    loaded += 1
+        enc.load_state_dict(enc_state)
     print(f'[SOPA] {loaded} keys loaded into bg_encoder.')
 
 
-def init_fg_encoder(model):
-    conv1 = model.fg_encoder1[0]
-    weight = conv1.weight.data
-    for i in range(weight.size(0)):
-        weight[i, 3] = (0.299 * weight[i, 0] + 0.587 * weight[i, 1] + 0.114 * weight[i, 2])
-    conv1.weight.data = weight
-    print('[FG-Encoder] Greyscale-init applied.')
+def load_encoder_pretrain(model, sopa_path, data_dir):
+    """Load pretrained weights for both encoders."""
+    import torchvision.models as tv_models
+
+    # ---- ImageNet for fg_encoder + bg_encoder (baseline) ----
+    imgnet = tv_models.resnet18(weights='DEFAULT').state_dict()
+    _copy_imagenet_to_encoder(model, imgnet)
+    print('[Encoder] ImageNet ResNet18 loaded for bg_encoder + fg_encoder.')
+
+    # ---- SOPA for bg_encoder (override if available) ----
+    if os.path.exists(sopa_path):
+        state = torch.load(sopa_path, map_location='cpu')
+        if 'state_dict' in state:
+            state = state['state_dict']
+        # Some checkpoints wrap in DataParallel
+        state = {k.replace('module.', ''): v for k, v in state.items()}
+        _copy_sopa_to_bg_encoder(model, state)
+    else:
+        print(f'[SOPA] {sopa_path} not found — keeping ImageNet weights for bg_encoder.')
 
 
 def freeze_encoders(model):
@@ -172,16 +279,20 @@ def validate(model, loader, criterion, device, epoch, writer, is_gaussian):
     loss_m = AverageMeter()
     metrics = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
     for batch in tqdm(loader, desc='Valid', leave=False):
+        # Validation always uses sparse data (4 items), regardless of training type
+        bg, fg, mk, target = [b.to(device) for b in batch]
+        logits = model(bg, fg, mk)
+
         if is_gaussian:
-            bg, fg, mk, target, valid_mask = [b.to(device) for b in batch]
-            logits = model(bg, fg, mk)
-            loss = criterion(logits, target, valid_mask)
-            m = compute_metrics(logits, target)
+            # Focal model: 1ch sigmoid → compute BCE loss on sparse target
+            ignore_mask = (target != 255)
+            pred_flat = logits.squeeze(1)[ignore_mask]
+            tgt_flat = target[ignore_mask].float()
+            loss = F.binary_cross_entropy(pred_flat, tgt_flat)
         else:
-            bg, fg, mk, target = [b.to(device) for b in batch]
-            logits = model(bg, fg, mk)
             loss = criterion(logits, target)
-            m = compute_metrics(logits, target, 255)
+
+        m = compute_metrics(logits, target, 255)
         loss_m.update(loss.item(), bg.size(0))
         for k in ['TP', 'TN', 'FP', 'FN']:
             metrics[k] += m[k]
@@ -229,10 +340,9 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f'Model: {cfg["model_type"]} ({n_params:,} params, out={model.out_channels}ch)')
 
-    # Init encoders
+    # Init encoders (ImageNet pretrain for both, SOPA for bg_encoder if available)
     sopa = os.path.join(cfg['data_dir'], 'SOPA.pth.tar')
-    load_sopa_encoder(model, sopa)
-    init_fg_encoder(model)
+    load_encoder_pretrain(model, sopa, cfg['data_dir'])
     if cfg.get('freeze_encoders', True):
         freeze_encoders(model)
 

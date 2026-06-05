@@ -174,21 +174,25 @@ def _build_fg_encoder():
 class _TransformerModule(nn.Module):
     """Fixed: correct LayerNorm dim + batch_first MHA."""
 
-    def __init__(self, embed_dim=1024, num_heads=8):
+    def __init__(self, embed_dim=1024, num_heads=8, mlp_expansion=4):
+        """
+        Args:
+            embed_dim:     Feature dimension (1024).
+            num_heads:     Attention heads (8).
+            mlp_expansion: MLP hidden = embed_dim * mlp_expansion.
+                           4 = 79M model, 8 = 113M model.
+        """
         super().__init__()
-        # FIX 1: LayerNorm on feature dimension, not spatial
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn  = nn.MultiheadAttention(embed_dim, num_heads,
-                                           batch_first=True)  # FIX 2
+                                           batch_first=True)
         self.norm2 = nn.LayerNorm(embed_dim)
 
-        # Per-token MLP (replaces the gigantic 65536→128→65536)
-        # Keeping the original structure for weight compatibility notes,
-        # but defaulting to a more efficient per-token design.
+        hidden = embed_dim * mlp_expansion
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
+            nn.Linear(embed_dim, hidden),
             nn.GELU(),
-            nn.Linear(embed_dim * 4, embed_dim),
+            nn.Linear(hidden, embed_dim),
         )
 
     def forward(self, x):
@@ -218,10 +222,11 @@ class _TransformerModule(nn.Module):
 
 
 class _Transformer(nn.Module):
-    def __init__(self, embed_dim=1024, num_heads=8, num_layers=4):
+    def __init__(self, embed_dim=1024, num_heads=8, num_layers=4,
+                 mlp_expansion=4):
         super().__init__()
         self.layers = nn.ModuleList([
-            _TransformerModule(embed_dim, num_heads)
+            _TransformerModule(embed_dim, num_heads, mlp_expansion)
             for _ in range(num_layers)
         ])
 
@@ -252,11 +257,11 @@ class ObPlaNet_resnet18(nn.Module):
     Total params: ~113M (original) / reduced with per-token MLP.
     """
 
-    def __init__(self, out_channels: int = 2):
+    def __init__(self, out_channels: int = 2, mlp_expansion: int = 4):
         """
         Args:
-            out_channels: 2 = original binary classifier,
-                          1 = keypoint-style heatmap regression (Sigmoid).
+            out_channels:  2 = binary classifier, 1 = keypoint heatmap.
+            mlp_expansion: 4 = 79M model, 8 = 113M model.
         """
         super().__init__()
         self.out_channels = out_channels
@@ -271,7 +276,8 @@ class ObPlaNet_resnet18(nn.Module):
 
         # ---- Transformer (FIXED) ----
         self.transformer = _Transformer(
-            embed_dim=1024, num_heads=8, num_layers=4)
+            embed_dim=1024, num_heads=8, num_layers=4,
+            mlp_expansion=mlp_expansion)
 
         # ---- UNet Decoder ----
         self.upconv32 = BasicConv2d(1024, 512, kernel_size=3, stride=1, padding=1)
@@ -339,8 +345,8 @@ class ObPlaNet_resnet18(nn.Module):
 class ObPlaNet_resnet18_keypoint(ObPlaNet_resnet18):
     """Keypoint-detection variant: output [B, 1, H, W] heatmap with Sigmoid."""
 
-    def __init__(self):
-        super().__init__(out_channels=1)
+    def __init__(self, mlp_expansion: int = 4):
+        super().__init__(out_channels=1, mlp_expansion=mlp_expansion)
 
 
 # ======================================================================
@@ -356,13 +362,19 @@ def build_model(name: str, **kwargs) -> nn.Module:
     """Build a TopNet variant by name.
 
     Args:
-        name:   'ObPlaNet_resnet18' (2ch) or
+        name:   'ObPlaNet_resnet18' (2ch),
                 'ObPlaNet_resnet18_keypoint' (1ch).
+                Append '_113M' suffix for mlp_expansion=8 version.
         kwargs: passed to the model constructor.
 
     Returns:
         nn.Module instance.
     """
+    if name.endswith('_113M'):
+        base = name.replace('_113M', '')
+        kwargs.setdefault('mlp_expansion', 8)
+        name = base
+
     if name not in _MODEL_REGISTRY:
         raise ValueError(f'Unknown model: {name}. '
                          f'Available: {list(_MODEL_REGISTRY.keys())}')

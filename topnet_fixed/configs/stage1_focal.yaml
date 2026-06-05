@@ -21,7 +21,7 @@ weight_decay: 1.0e-4
 loss: "focal"
 focal_alpha: 2.0
 focal_beta: 4.0
-gaussian_sigma_factor: 6.0
+gaussian_sigma_factor: 12.0
 focal_full_supervision: false
 
 patience: 8
