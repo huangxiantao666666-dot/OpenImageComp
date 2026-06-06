@@ -791,3 +791,112 @@ libcom 的预训练权重通过 `libcom/utils/model_download.py` 统一管理:
 | 任务 | 放置评估 (单点评分) | 放置预测 (全图热力图) | 10+ 子任务 |
 | 架构 | ResNet + FC | 双 ResNet + Transformer + UNet | 各模型独立架构 |
 | 模型数量 | 2 (SimOPA, SimOPA-ext) | 3 (CNN, ViT, Simple) | 13 个公开 API |
+
+---
+
+## 6. OpenImageComp: 我们的工作
+
+### 6.1 TopNet Transformer 修复
+
+原始 TopNet 的 Transformer block 存在两处 bug：
+
+**Bug 1 — LayerNorm 维度错误**
+```
+原始:  LayerNorm(8) on [B, 1024, 8, 8]  → 在空间列方向 (W=8) 归一化
+修复:  LayerNorm(1024) on tokens [B, 64, 1024] → 在特征维度归一化
+```
+
+**Bug 2 — MHA 的 batch/seq 维度错位**
+```
+原始:  [B, 64, 1024] + batch_first=False → MHA 将 B 当作 seq_len, 64 当作 batch
+      → B>1 训练时跨图像信息泄露, B=1 推理时注意力退化为恒等映射
+修复:  [B, 64, 1024] + batch_first=True → 正确地在 64 个空间 token 之间做自注意力
+```
+
+**Bug 3 — 全局 FC MLP 改 per-token MLP**
+```
+原始:  Linear(65536 → 128 → 65536), 每层 17M 参数, 共 67M
+      → 全特征图展平全连接, 本质是 65K 像素间的全局查找表
+修复:  Linear(1024 → 4096 → 1024) per-token, 每层 8.4M, 共 34M
+      → 标准 Transformer 设计, 113M 版本用 hidden=8192
+```
+
+### 6.2 模型规模变体
+
+| 版本 | MLP hidden | 总参数 | 用途 |
+|------|-----------|--------|------|
+| 标准 (79M) | 4096 (4×) | 79,382,913 | 默认训练 |
+| 扩展 (113M) | 8192 (8×) | 112,953,729 | 对标原版 buggy 模型参数 |
+
+通过 `mlp_expansion` 参数控制, 在 YAML 中用 `model_type: "ObPlaNet_resnet18_keypoint_113M"` 选择。
+
+### 6.3 损失函数设计
+
+#### 方案 A: 稀疏 CrossEntropy (baseline)
+- 标注: 单像素 0/1/255
+- `CrossEntropyLoss(ignore_index=255)` — 只在标注像素上计算
+- 优点: 训练和评估目标完全一致
+- 缺点: 每图仅 1-10 像素有监督, 容易过拟合
+
+#### 方案 B: Focal Loss + 局部高斯热力图 (推荐)
+- 标注: pos_label → 2D 高斯峰, σ = min(fg_w,fg_h) / 8
+- neg_label → 5px 窗口内显式压 0
+- `valid_mask`: 只在高斯峰区域 + neg 窗口计算 loss, 其余区域不监督
+- `FocalLoss(alpha=2, beta=4)`: 归一化按峰中心数量, 而非高斯像素数
+- 优点: 密集监督 (4.7% 像素), 不滥用未标注数据
+- 缺点: 训练目标 (高斯回归) 和评估目标 (稀疏分类) 不完全一致
+
+#### 方案 C: Focal Loss + 全图监督 (已放弃)
+- 所有像素都参与 loss: pos=高斯峰, 其余=0
+- 添加 `pos_weight=50` 对抗极端不平衡
+- 结果: 模型预测全 0 (F1=0), 因为 99.9% 像素是背景
+- 结论: 未标注像素 ≠ 不合理, 全图监督违背标注语义
+
+#### 方案 D: Label Dilation + CE (新增)
+- 将稀疏标注点膨胀为 r=3 的圆盘 (~29 px/点)
+- 继续用 `CrossEntropyLoss(ignore_index=255)`
+- 标注密度: 6 px/图 → 174 px/图 (29×)
+- 训练和评估目标完全一致
+
+### 6.4 两阶段训练策略
+
+| | Stage 1 | Stage 2 |
+|---|---|---|
+| bg_encoder | 冻结 (SOPA 预训练) | 解冻 |
+| fg_encoder | 冻结 (ImageNet 预训练) | 解冻 |
+| Transformer + Decoder | 训练 | 训练 |
+| LR | 1e-4 | 1e-5 |
+| 早停 | val_loss, patience=8 | val_loss, patience=12 |
+
+### 6.5 实验结果 (完整测试集, 2568 张)
+
+| 模型 | F1 | bAcc | Precision | Recall | 参数 |
+|------|-----|------|-----------|--------|------|
+| Buggy TopNet (原版) | 0.658 | 0.753 | 0.591 | 0.742 | 113M |
+| CE baseline (79M) | 0.660 | 0.750 | 0.710 | 0.617 | 79M |
+| Focal partial (79M) | 0.672 | 0.764 | 0.611 | 0.746 | 79M |
+| **Focal partial (113M)** | **0.672** | **0.766** | 0.581 | 0.796 | 113M |
+
+### 6.6 Placement App 设计
+
+**三大模式**:
+- **Auto Search** (Tab 1): TopNet 热力图 / Grid 网格枚举 → SimOPA 精排 Top-5
+- **Custom Upload** (Tab 2): 用户自选背景+前景, 同上流程
+- **Manual Placement** (Tab 3): 点击背景图放置前景, slider 调缩放/旋转, harmonization 开关
+
+**Mask 分割**: SAM2.1 / OpenCV / alpha channel / 手动上传
+
+**Harmonization**: PCTNet (ViT, 4.8M) → fallback Reinhard (Lab 统计匹配)
+
+### 6.7 Android App 设计
+
+**架构**: 客户端-服务器, Kotlin Jetpack Compose + Retrofit, FastAPI 后端
+
+**API 端点**:
+- `POST /api/place` — 自动搜索
+- `POST /api/place_manual` — 点击放置
+- `POST /api/harmonize` — 颜色协调
+- `POST /api/mask` — 前景分割
+- `GET /api/health` — 服务状态
+
+详见 `CodeDesign.md`。

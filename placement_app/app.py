@@ -33,8 +33,8 @@ from pipeline.auto_mask import auto_mask
 # ---------------------------------------------------------------------------
 _simopa_scorer: PlacementScorer = None
 _topnet_scorer: TopNetScorer = None
-TOP_MODEL_PATH = os.path.join(PROJ_ROOT, '..',
-    'TopNet-Object-Placement-main', 'best_weight.pth')
+TOP_MODEL_PATH = os.path.join(PROJ_ROOT, '..', 'topnet_fixed',
+    'checkpoints', 'buggy_best_weight.pth')
 SIMOPA_PATH = os.path.join(PROJ_ROOT, 'models', 'weights', 'simopa.pth')
 
 
@@ -54,7 +54,7 @@ def get_topnet() -> TopNetScorer:
             _topnet_scorer = TopNetScorer(TOP_MODEL_PATH, device='cuda')
         else:
             _topnet_scorer = TopNetScorer(
-                os.path.join(PROJ_ROOT, 'models', 'weights', 'best_weight.pth'),
+                os.path.join(PROJ_ROOT, 'models', 'weights', 'buggy_best_weight.pth'),
                 device='cuda')
     return _topnet_scorer
 

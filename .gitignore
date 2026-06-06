@@ -16,9 +16,13 @@ pretrained_models/
 !**/checkpoints/.gitkeep
 !**/best_weight/.gitkeep
 
-# Datasets (all levels)
+# Datasets (actual image data, not Python files)
 OPA/dataset/
-**/data/data/
+topnet_fixed/data/data/
+!topnet_fixed/data/*.py
+
+# Android app (teammate handles builds)
+ImageCompApp/
 
 # Python
 __pycache__/

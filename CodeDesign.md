@@ -1110,3 +1110,113 @@ libcom 内部:
   libcom/opa_score → 复用 OPA 项目的 SimOPA 架构和权重
   libcom/fopa_heat_map → 复用 FOPA 的项目架构和权重
 ```
+
+---
+
+## 五、OpenImageComp 新增代码详解
+
+### 5.1 placement_app — 交互应用
+
+```
+placement_app/
+├── app.py              # Gradio 三模式 Web 应用
+├── server.py           # FastAPI REST 服务 (供 Android 调用)
+├── sam2_demo.py        # SAM2 vs OpenCV 分割对比 Demo
+├── grad_cam.py         # Grad-CAM 模型解释
+├── test_cases.py       # 自动化测试用例
+├── models/
+│   ├── __init__.py     # SimOPA 模型 + SimOPAScorer
+│   ├── resnet_4ch.py   # 4ch ResNet + base_width 解耦
+│   ├── topnet.py       # ObPlaNet_resnet18 (buggy, 113M) + TopNetScorer
+│   ├── pct_net.py      # PCTNet 协调器封装
+│   ├── _pct_net_lib.py # PCTNet 网络结构 (从 libcom 提取)
+│   ├── _pct_functions_lib.py  # PCT + ViT_Harmonizer (从 libcom 提取)
+│   └── weights/        # simopa.pth, PCTNet.pth, IdentityLUT33.txt
+├── pipeline/
+│   ├── auto_mask.py    # SAM2.1 + OpenCV 自动分割
+│   ├── candidates.py   # 候选 bbox 网格生成
+│   ├── composite.py    # Alpha 混合合成
+│   ├── harmonize.py    # PCTNet / Reinhard 协调
+│   ├── scorer.py       # 批量评分 + 排序
+│   └── two_stage.py    # 粗筛→精排两阶段流水线
+└── assets/             # 8 背景 + 8 前景预设素材
+```
+
+**数据流**:
+```
+输入: bg + fg + mask
+  ↓
+[Auto Search]              [Manual Placement]
+  TopNet 热力图 → 局部最大值   点击背景图 → 合成
+  → 候选 bbox 列表            → 单张合成图
+  ↓                           ↓
+simopa.score() for each     simopa.score()
+  ↓                           ↓
+排名 → heatmap + gallery + detail table
+  ↓ (可选)
+harmonize() → PCTNet / Reinhard
+```
+
+**server.py 端点设计**:
+```
+POST /api/place         auto-search (TopNet/Grid) → heatmap + composites + table
+POST /api/place_manual  click-to-place → composite + score
+POST /api/harmonize     colour harmonization (PCTNet/Reinhard)
+POST /api/mask          foreground segmentation (SAM2/OpenCV/alpha)
+GET  /api/health        服务状态 + 已加载模型列表
+```
+
+### 5.2 topnet_fixed — 修复版训练管线
+
+```
+topnet_fixed/
+├── models/
+│   ├── topnet.py       # 修复版 ObPlaNet (79M/113M, 2ch/1ch)
+│   ├── _buggy_network.py    # 原始 TopNet 网络 (从源码复制)
+│   ├── _buggy_backbone.py   # 原始 ResNet 骨干
+│   └── _buggy_basic_conv2d.py # BasicConv2d
+├── losses.py           # CrossEntropy + FocalLoss(α=2,β=4) + pos_weight
+├── data/
+│   ├── dataset.py            # 稀疏 CE 数据集 + label dilation 支持
+│   └── dataset_gaussian.py   # 高斯热力图数据集 + valid_mask
+├── configs/            # 10 个 YAML 配置文件
+├── train_stage1.py     # Stage 1: 冻结编码器训练
+├── train_stage2.py     # Stage 2: 全模型微调
+├── test_exp.py         # 多模型对比评估
+└── sh_scripts/         # 13 个 bash 运行脚本
+```
+
+**模型训练入口**:
+```
+train_stage1.py --config configs/stage1_ce.yaml
+  → build_model(cfg['model_type'])  # e.g. ObPlaNet_resnet18 (2ch)
+  → get_dataloaders_from_cfg(cfg)   # sparse / gaussian
+  → get_loss(cfg)                   # cross_entropy / focal
+  → load_encoder_pretrain()         # SOPA + ImageNet
+  → freeze_encoders()               # only Transformer+Decoder trainable
+  → train loop + early stop + save history.json + config.yaml
+```
+
+**YAML 配置驱动**:
+```yaml
+model_type: "ObPlaNet_resnet18_keypoint_113M"  # 选择模型变体
+data_type: "gaussian"                           # sparse / gaussian
+loss: "focal"                                   # cross_entropy / focal
+focal_alpha: 2.0                                # Focal Loss 参数
+focal_beta: 4.0
+focal_pos_weight: 50.0
+gaussian_sigma_factor: 8.0                      # σ = min(w,h) / factor
+focal_full_supervision: false                   # true = 全图监督
+label_dilation: 3                               # 0 = 不膨胀, >0 = 圆盘半径
+```
+
+### 5.3 ImageCompApp — Android 客户端
+
+Kotlin Jetpack Compose + Retrofit + Moshi, 与 `server.py` 通过 REST JSON 通信。
+
+**数据流**:
+```
+[Home Screen] → 检查服务健康 (GET /api/health)
+  ├→ [Auto Search] → 选图 → POST /api/place → [Result: heatmap + gallery + table]
+  └→ [Manual] → 选图 → 点击背景 → POST /api/place_manual → [Result: composite + score]
+```

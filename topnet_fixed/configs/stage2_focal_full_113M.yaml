@@ -1,10 +1,10 @@
-# Experiment B (113M scaled-up): Partial Focal Loss - Stage 2
-# python train_stage2.py --config configs/stage2_focal_113M.yaml
+# Experiment C (113M): Full-supervision Focal Loss - Stage 2
+# python train_stage2.py --config configs/stage2_focal_full_113M.yaml
 
 data_dir: "./data/data"
-checkpoint_dir: "./checkpoints/expB_focal_113M"
-log_dir: "./logs/expB_focal_113M/stage2"
-stage1_ckpt: "./checkpoints/expB_focal_113M/stage1_best.pth"
+checkpoint_dir: "./checkpoints/expC_focal_full_113M"
+log_dir: "./logs/expC_focal_full_113M/stage2"
+stage1_ckpt: "./checkpoints/expC_focal_full_113M/stage1_best.pth"
 
 model_type: "ObPlaNet_resnet18_keypoint_113M"
 freeze_encoders: false
@@ -22,8 +22,9 @@ weight_decay: 1.0e-4
 loss: "focal"
 focal_alpha: 2.0
 focal_beta: 4.0
+focal_pos_weight: 50.0
 gaussian_sigma_factor: 8.0
-focal_full_supervision: false
+focal_full_supervision: true
 
 patience: 12
 early_stop_metric: "val_loss"

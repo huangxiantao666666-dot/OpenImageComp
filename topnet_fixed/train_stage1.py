@@ -60,10 +60,10 @@ def get_dataloaders_from_cfg(cfg):
     bs         = cfg.get('batch_size', 8)
     nw         = cfg.get('num_workers', 4)
 
-    # Validation: always sparse
+    # Validation: always sparse (no dilation)
     from data.dataset import get_dataloaders as get_sparse
     _, val_loader = get_sparse(train_json, test_json, bg_dir, fg_dir,
-                                img_size, bs, nw)
+                                img_size, bs, nw, label_dilation=0)
 
     # Training: config-driven
     if cfg.get('data_type') == 'gaussian':
@@ -74,8 +74,10 @@ def get_dataloaders_from_cfg(cfg):
                                                      bg_dir, fg_dir,
                                                      img_size, bs, nw, sf, fs)
     else:
+        dilation = cfg.get('label_dilation', 0)
         train_loader, _ = get_sparse(train_json, test_json, bg_dir, fg_dir,
-                                      img_size, bs, nw)
+                                      img_size, bs, nw,
+                                      label_dilation=dilation)
 
     return train_loader, val_loader
 
@@ -95,9 +97,9 @@ def compute_metrics(logits, target, ignore_index=255):
     preds = logits.argmax(dim=1) if logits.shape[1] == 2 else \
             (logits > 0.5).long().squeeze(1)
     if logits.shape[1] == 1:
-        # keypoint: target is [B,1,H,W], not [B,H,W] with ignore=255
-        target_labels = (target > 0.01).long()
-        mask = torch.ones_like(target_labels).bool()
+        # keypoint: target is sparse [B,H,W] with 0/1/255 when used for val
+        target_labels = target.long()
+        mask = (target_labels != ignore_index)
     else:
         target_labels = target
         mask = (target != ignore_index)
@@ -397,9 +399,12 @@ def main():
             break
 
     print(f'\nStage 1 done. Best val loss: {best_val_loss:.4f}')
-    # Save history + config for plotting
+    # Save history + config for plotting / reproducibility
     with open(os.path.join(cfg['log_dir'], 'history.json'), 'w') as f:
         json.dump({'history': history, 'config': cfg}, f, indent=2)
+    # Also save a standalone copy of the config
+    with open(os.path.join(cfg['log_dir'], 'config.yaml'), 'w') as f:
+        yaml.dump(cfg, f, default_flow_style=False)
     writer.close()
 
 

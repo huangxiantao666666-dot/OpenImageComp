@@ -13,7 +13,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.topnet import build_model
-from data.dataset import get_dataloaders
+from data.dataset import PlacementDataset
+from torch.utils.data import DataLoader
 
 
 # ======================================================================
@@ -120,10 +121,12 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate all TopNet models')
     parser.add_argument('--data_dir', default='./data/data')
     parser.add_argument('--buggy_weight',
-                        default='../TopNet-Object-Placement-main/best_weight.pth')
+                        default='./checkpoints/buggy_best_weight.pth')
     parser.add_argument('--expA_ckpt', default='./checkpoints/expA_ce/stage2_best.pth')
     parser.add_argument('--expB_ckpt', default='./checkpoints/expB_focal/stage2_best.pth')
     parser.add_argument('--expC_ckpt', default='./checkpoints/expC_focal_full/stage2_best.pth')
+    parser.add_argument('--expB113M_ckpt', default='./checkpoints/expB_focal_113M/stage2_best.pth')
+    parser.add_argument('--expC113M_ckpt', default='./checkpoints/expC_focal_full_113M/stage2_best.pth')
     parser.add_argument('--quick', action='store_true',
                         help='Only evaluate on first 4 batches (fast check)')
     parser.add_argument('--batch_size', type=int, default=32)
@@ -138,11 +141,10 @@ def main():
     bg_dir = os.path.join(args.data_dir, 'bg')
     fg_dir = os.path.join(args.data_dir, 'fg')
 
-    _, test_loader = get_dataloaders(
-        None, test_json, bg_dir, fg_dir,
-        image_size=256, batch_size=args.batch_size, num_workers=4)
-    print(f'Test set: {len(test_loader.dataset)} samples, '
-          f'{len(test_loader)} batches')
+    test_ds = PlacementDataset(test_json, bg_dir, fg_dir, train=False)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size,
+                              shuffle=False, num_workers=4, pin_memory=True)
+    print(f'Test set: {len(test_ds)} samples, {len(test_loader)} batches')
 
     # ---- Evaluate all models ----
     results = {}
@@ -191,6 +193,32 @@ def main():
         results['expC_focal_full'] = r
     else:
         print(f'\n[Skipping] Exp C not found: {args.expC_ckpt}')
+
+    # Exp B 113M
+    if os.path.exists(args.expB113M_ckpt):
+        print('\n--- Exp B (113M): Partial Focal ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18_keypoint_113M',
+                                     args.expB113M_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=kp,
+                     model_name='Exp B 113M', quick=args.quick)
+        r['params'] = n
+        r['type'] = 'fixed_Focal_partial_113M'
+        results['expB_focal_partial_113M'] = r
+    else:
+        print(f'\n[Skipping] Exp B 113M not found: {args.expB113M_ckpt}')
+
+    # Exp C 113M
+    if os.path.exists(args.expC113M_ckpt):
+        print('\n--- Exp C (113M): Full-supervision Focal ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18_keypoint_113M',
+                                     args.expC113M_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=kp,
+                     model_name='Exp C 113M', quick=args.quick)
+        r['params'] = n
+        r['type'] = 'fixed_Focal_full_113M'
+        results['expC_focal_full_113M'] = r
+    else:
+        print(f'\n[Skipping] Exp C 113M not found: {args.expC113M_ckpt}')
 
     # ---- Summary ----
     print('\n' + '=' * 75)
