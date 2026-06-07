@@ -33,10 +33,12 @@ def evaluate(model, loader, device, is_keypoint=False, model_name='', quick=Fals
 
     Returns:
         dict with 'f1', 'bAcc', 'precision', 'recall', 'TP', 'TN', 'FP', 'FN',
-        'inference_time_s', 'params'
+        'inference_time_s', 'params', and 'ap' for keypoint models.
     """
     model.eval()
     metrics = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
+    all_scores = []  # for AP computation (keypoint only)
+    all_labels = []
     t0 = time.time()
 
     for bi, (bg, fg, mask, target) in enumerate(
@@ -49,10 +51,15 @@ def evaluate(model, loader, device, is_keypoint=False, model_name='', quick=Fals
         if quick and bi >= 3: break
 
         if is_keypoint:
-            # [B, 1, H, W] → threshold at 0.5 → [B, H, W]
-            preds = (logits.squeeze(1) > 0.5).long()
+            scores = logits.squeeze(1)                    # [B, H, W] probs
+            preds = (scores > 0.5).long()
+            # Collect raw scores + labels for AP (only on labeled pixels)
+            valid = (target != 255)
+            for b in range(scores.shape[0]):
+                v = valid[b]
+                all_scores.append(scores[b][v].flatten())
+                all_labels.append(target[b][v].long().flatten())
         else:
-            # [B, 2, H, W] → argmax
             preds = logits.argmax(dim=1)
 
         valid = (target != 255)
@@ -72,13 +79,78 @@ def evaluate(model, loader, device, is_keypoint=False, model_name='', quick=Fals
     f1 = 2 * prec * rec / max(prec + rec, 1e-8)
     bAcc = 0.5 * (TP / max(TP + FN, 1) + TN / max(TN + FP, 1))
 
-    return {
+    result = {
         'f1': round(f1, 4), 'bAcc': round(bAcc, 4),
         'precision': round(prec, 4), 'recall': round(rec, 4),
         'TP': TP, 'TN': TN, 'FP': FP, 'FN': FN,
         'inference_time_s': round(elapsed, 2),
         'num_samples': len(loader.dataset),
     }
+
+    # AP metrics (keypoint models only)
+    if is_keypoint and all_scores:
+        ap_data = _compute_ap(all_scores, all_labels)
+        result.update(ap_data)
+
+    return result
+
+
+def _compute_ap(all_scores, all_labels):
+    """Compute AP and PR-curve metrics from collected scores and labels.
+
+    Returns dict with 'ap', 'ap50', 'ap75', 'ap90', and per-threshold
+    precision/recall/F1 for thresholds 0.5:0.05:0.95.
+    """
+    import numpy as np
+    scores = torch.cat(all_scores).cpu().numpy()
+    labels = torch.cat(all_labels).cpu().numpy()
+
+    order = np.argsort(scores)[::-1]
+    labels = labels[order]
+
+    tp = (labels == 1).astype(np.float32)
+    fp = (labels == 0).astype(np.float32)
+    n_pos = tp.sum()
+
+    tp_cum = np.cumsum(tp)
+    fp_cum = np.cumsum(fp)
+
+    prec_curve = tp_cum / np.maximum(tp_cum + fp_cum, 1)
+    rec_curve  = tp_cum / max(n_pos, 1)
+
+    # VOC-style AP: max-precision interpolation at 101 recall levels
+    for i in range(len(prec_curve) - 1, 0, -1):
+        prec_curve[i - 1] = max(prec_curve[i - 1], prec_curve[i])
+    recall_levels = np.linspace(0, 1, 101)
+    ap_values = np.interp(recall_levels,
+                          np.concatenate([[0.0], rec_curve, [1.0]]),
+                          np.concatenate([[1.0], prec_curve, [0.0]]))
+    ap = float(np.mean(ap_values))
+
+    # AP at fixed thresholds and range average
+    def metrics_at_thresh(t):
+        preds_i = (scores >= t).astype(np.int64)
+        tp_i = ((preds_i == 1) & (labels == 1)).sum()
+        fp_i = ((preds_i == 1) & (labels == 0)).sum()
+        fn_i = ((preds_i == 0) & (labels == 1)).sum()
+        p_i = tp_i / max(tp_i + fp_i, 1)
+        r_i = tp_i / max(tp_i + fn_i, 1)
+        f1_i = 2 * p_i * r_i / max(p_i + r_i, 1e-8)
+        return f1_i
+
+    result = {'ap': round(ap, 4), 'n_pos': int(n_pos)}
+    for t_label, t_val in [('ap50', 0.5), ('ap75', 0.75), ('ap90', 0.9)]:
+        result[f'{t_label}_F1'] = round(metrics_at_thresh(t_val), 4)
+
+    # AP over 0.5:0.05:0.95 (average F1 across thresholds)
+    thresholds = np.arange(0.5, 0.96, 0.05)
+    f1_values = [metrics_at_thresh(t) for t in thresholds]
+    result['ap_mean_050_095'] = round(float(np.mean(f1_values)), 4)
+    # Per-threshold breakdown
+    for t, f1v in zip(thresholds, f1_values):
+        result[f'ap@{t:.2f}_F1'] = round(float(f1v), 4)
+
+    return result
 
 
 # ======================================================================
@@ -123,6 +195,8 @@ def main():
     parser.add_argument('--buggy_weight',
                         default='./checkpoints/buggy_best_weight.pth')
     parser.add_argument('--expA_ckpt', default='./checkpoints/expA_ce/stage2_best.pth')
+    parser.add_argument('--expA113M_ckpt', default='./checkpoints/expA_ce_113M/stage2_best.pth')
+    parser.add_argument('--expADilated_ckpt', default='./checkpoints/expA_ce_dilated/stage2_best.pth')
     parser.add_argument('--expB_ckpt', default='./checkpoints/expB_focal/stage2_best.pth')
     parser.add_argument('--expC_ckpt', default='./checkpoints/expC_focal_full/stage2_best.pth')
     parser.add_argument('--expB113M_ckpt', default='./checkpoints/expB_focal_113M/stage2_best.pth')
@@ -146,8 +220,16 @@ def main():
                               shuffle=False, num_workers=4, pin_memory=True)
     print(f'Test set: {len(test_ds)} samples, {len(test_loader)} batches')
 
-    # ---- Evaluate all models ----
+    # ---- Evaluate all models (with GPU cleanup between) ----
     results = {}
+
+    def _cleanup(model=None):
+        if model is not None:
+            del model
+        import gc
+        gc.collect()
+        if 'cuda' in str(device):
+            torch.cuda.empty_cache()
 
     # Buggy TopNet
     if os.path.exists(args.buggy_weight):
@@ -158,6 +240,7 @@ def main():
         r['params'] = buggy_n
         r['type'] = 'buggy_original'
         results['buggy_original'] = r
+        _cleanup(buggy)
     else:
         print(f'\n[Skipping] Buggy TopNet weight not found: {args.buggy_weight}')
 
@@ -168,9 +251,36 @@ def main():
         r = evaluate(m, test_loader, device, is_keypoint=kp, model_name='Exp A', quick=args.quick)
         r['params'] = n
         r['type'] = 'fixed_CE'
+        _cleanup(m)
         results['expA_sparse_CE'] = r
     else:
         print(f'\n[Skipping] Exp A not found: {args.expA_ckpt}')
+
+    # Exp A 113M
+    if os.path.exists(args.expA113M_ckpt):
+        print('\n--- Exp A (113M): Sparse CrossEntropy ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18_113M', args.expA113M_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=False,
+                     model_name='Exp A 113M', quick=args.quick)
+        r['params'] = n
+        _cleanup(m)
+        r['type'] = 'fixed_CE_113M'
+        results['expA_CE_113M'] = r
+    else:
+        print(f'\n[Skipping] Exp A 113M not found: {args.expA113M_ckpt}')
+
+    # Exp A Dilated
+    if os.path.exists(args.expADilated_ckpt):
+        print('\n--- Exp A2: Dilated CrossEntropy (r=3) ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18', args.expADilated_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=False,
+                     model_name='Exp A2 dilated', quick=args.quick)
+        _cleanup(m)
+        r['params'] = n
+        r['type'] = 'fixed_CE_dilated'
+        results['expA_CE_dilated'] = r
+    else:
+        print(f'\n[Skipping] Exp A Dilated not found: {args.expADilated_ckpt}')
 
     # Exp B
     if os.path.exists(args.expB_ckpt):
@@ -186,7 +296,6 @@ def main():
     # Exp C
     if os.path.exists(args.expC_ckpt):
         print('\n--- Exp C: Full-supervision Focal ---')
-        m, n, kp = load_fixed_model('ObPlaNet_resnet18_keypoint', args.expC_ckpt, device)
         r = evaluate(m, test_loader, device, is_keypoint=kp, model_name='Exp C')
         r['params'] = n
         r['type'] = 'fixed_Focal_full'
@@ -224,16 +333,18 @@ def main():
     print('\n' + '=' * 75)
     print('  Evaluation Summary')
     print('=' * 75)
-    header = f'  {"Model":<25s} {"F1":>8s} {"bAcc":>8s} {"Prec":>8s} {"Recall":>8s} {"Time":>8s} {"Params":>10s}'
+    header = f'  {"Model":<25s} {"F1":>8s} {"bAcc":>8s} {"AP":>8s} {"AP@.5":>8s} {"Time":>8s} {"Params":>10s}'
     print(header)
     print('  ' + '-' * 73)
     for name, r in results.items():
-        print(f'  {name:<25s} {r["f1"]:>8.4f} {r["bAcc"]:>8.4f} '
-              f'{r["precision"]:>8.4f} {r["recall"]:>8.4f} '
+        ap_str = f'{r.get("ap", "-"):>8s}' if isinstance(r.get('ap'), str) else f'{r["ap"]:>8.4f}' if 'ap' in r else f'{"-":>8s}'
+        ap50_str = f'{r.get("ap@0.5_F1", "-"):>8s}' if isinstance(r.get('ap@0.5_F1'), str) else f'{r["ap@0.5_F1"]:>8.4f}' if 'ap@0.5_F1' in r else f'{"-":>8s}'
+        print(f'  {name:<25s} {r["f1"]:>8.4f} {r["bAcc"]:>8.4f} {ap_str} {ap50_str} '
               f'{r["inference_time_s"]:>7.1f}s {r["params"]:>10,}')
 
     # Reference from paper
     print(f'\n  Reference (original TopNet paper): F1=0.741  bAcc=0.815')
+    print(f'  AP metrics: {"AP" if "ap" in next(iter(results.values())) else "available only for keypoint (1ch) models"}')
 
     # Save
     os.makedirs('./logs', exist_ok=True)

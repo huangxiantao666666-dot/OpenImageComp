@@ -71,7 +71,9 @@ Endpoints: `/api/place`, `/api/place_manual`, `/api/harmonize`, `/api/mask`, `/a
 
 Dataset and pretrained weights are available at:
 
-> **SJTU Cloud Drive**: [link to be added]
+> **SJTU Cloud Drive**: [
+https://pan.sjtu.edu.cn/web/share/7d842afe7e9850ff1d5453dc62a19a7a](
+https://pan.sjtu.edu.cn/web/share/7d842afe7e9850ff1d5453dc62a19a7a)(code: njb3)
 
 Place under `topnet_fixed/data/data/`:
 
@@ -177,6 +179,29 @@ Reference (original TopNet paper): F1=0.741, bAcc=0.815
 - CenterNet: [Objects as Points](https://arxiv.org/abs/1904.07850) (Zhou et al., 2019)
 - SAM2: [Segment Anything 2](https://github.com/facebookresearch/sam2) (Meta)
 - PCTNet / Reinhard: from [libcom](https://github.com/bcmi/libcom) harmonization toolkit
+
+## Model Interpretability
+
+The Gradio app provides five interpretability views on the top-ranked placement result:
+
+| Tab | Method | What it shows |
+|-----|--------|---------------|
+| Grad-CAM | Gradient-weighted CAM on SimOPA | Which image regions the model focuses on |
+| Saliency | Input gradient magnitude | Which pixels most influence the score |
+| Occlusion | Sliding gray-window score drop | Where occlusion causes the largest score decrease |
+| Features L2 | ResNet layer2 activations | Mid-level features (textures, edges) |
+| Features L4 | ResNet layer4 activations | Deep features (semantics, layout) |
+
+## Server for Android App
+
+```bash
+cd placement_app
+pip install fastapi uvicorn
+python server.py --port 8000
+# → http://<your-ip>:8000/docs
+```
+
+REST API: `/api/place`, `/api/place_manual`, `/api/harmonize`, `/api/mask`, `/api/health`
 
 ## License
 

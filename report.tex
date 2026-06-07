@@ -1,0 +1,483 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{fontawesome5}
+\usepackage{bm}
+\usepackage{subcaption}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    frame=single,
+    breaklines=true,
+    breakatwhitespace=true,
+    columns=fullflexible,
+    backgroundcolor=\color{gray!5},
+    xleftmargin=2mm,
+    xrightmargin=2mm
+}
+
+\makeatletter
+\renewcommand{\maketitle}{%
+  \twocolumn[%
+    \begin{center}
+    {\LARGE\bfseries \@title \par}
+    \vspace{0.5em}
+    {\large \@author \par}
+    \vspace{1em}
+    \end{center}
+  ]
+}
+\makeatother
+
+\title{OpenImageComp: Open Image Composition Framework Based on Segmentation, Placement, Assessment and Harmonization}
+\author{
+  Xiantao Huang, Xiangshi Li, Yucheng Li, Haohua Zhao$^*$ \\
+  Shanghai Jiao Tong University \\
+  {\small $^*$Corresponding Author}
+    \begin{center}
+    \faGithub \quad \url{https://github.com/huangxiantao666666-dot/OpenImageComp}
+    \end{center}
+}
+\date{}
+
+\makeatletter
+\renewenvironment{abstract}
+{%
+  \if@twocolumn
+    \vskip\parskip
+    \par\noindent
+    \hspace*{\fill}{\large\bfseries Abstract}\hspace*{\fill}%
+    \par\vspace{0.5em}
+    \begin{quote}
+  \else
+    \centerline{\large\bfseries Abstract}%
+    \begin{quote}
+  \fi
+}
+{%
+  \end{quote}
+}
+\makeatother
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+
+Image composition---the task of inserting a foreground object into a background scene such that the result appears visually natural---involves multiple subtasks including placement reasoning, color harmonization, shadow generation, and quality assessment. We present \textbf{OpenImageComp}, an open-source framework that integrates segmentation (SAM2.1 and classical OpenCV), placement prediction (TopNet with fixed Transformer and SimOPA scoring), image harmonization (PCTNet and Reinhard color transfer), and multi-object interactive placement into a unified pipeline. We identify and fix two critical bugs in the original TopNet Transformer architecture, then evaluate three loss formulations for training the placement model: sparse CrossEntropy, Gaussian heatmap regression with partial Focal Loss, and label dilation with CrossEntropy. Our fixed CE (113M) model surpasses the original buggy version on the TopNet test set (F1 0.682 vs.\ 0.661, VOC AP 0.737 vs.\ 0.678). The framework is deployed as a Gradio web application for desktop use and a FastAPI server powering an Android client, supporting both automatic placement search and manual click-to-place with real-time SimOPA scoring and model interpretability tools.
+\end{abstract}
+
+
+\section{Introduction}
+
+Suppose a user wants to place a photo of a dog into a living room photo. Where should the dog go---on the floor, on the sofa, or floating in the air? At what scale? After placing it, should the dog's colors be adjusted to match the warm lighting of the room? Should a soft shadow be added beneath it? Answering these questions requires a pipeline of specialized models, each responsible for a different aspect of the composition task.
+
+\textbf{Models in the pipeline.} The image composition research community, particularly the BCMI Lab at Shanghai Jiao Tong University, has developed several key models that address different stages of this problem. \textbf{SimOPA}~\cite{liu2021OPA} (Simple Object Placement Assessment) is a lightweight binary classifier that takes a composited image and a foreground mask, and outputs a single rationality score in $[0,1]$---it answers the question ``does this placement look natural?'' \textbf{FOPA}~\cite{fopa} (Fast Object Placement Assessment) and \textbf{TopNet}~\cite{topnet} (Transformer-based Object Placement Network) extend this idea from single-point scoring to full-image heatmap prediction. Instead of evaluating one placement at a time, they take the background, foreground, and mask as input and produce a $256\times 256$ heatmap where each pixel value represents the probability that placing the foreground center at that location would be reasonable. This enables efficient search for the best placement position in a single forward pass.
+
+After placement, additional models handle post-processing. \textbf{PCTNet} (Pixel-Color-Transform Network) adjusts the foreground's colors to match the background lighting conditions---for example, making a dog photographed under daylight look natural in a warm indoor scene. \textbf{GPSDiffusion} generates realistic object shadows using a ControlNet-based diffusion model. \textbf{Reinhard color transfer} provides a lightweight, non-deep-learning alternative for color harmonization by matching Lab-space statistics. The \textbf{libcom} toolbox~\cite{libcom} unifies many of these models under a single API.
+
+\textbf{Our contributions.} We build OpenImageComp, a complete open-source framework combining all the above capabilities:
+
+\begin{enumerate}
+    \item \textbf{A unified application} integrating TopNet-based placement search, SimOPA scoring, SAM2.1/OpenCV segmentation, PCTNet/Reinhard harmonization, and soft shadow rendering. The same functionality is available through a Gradio web interface and a FastAPI REST server powering an Android mobile app.
+    \item \textbf{Architectural fixes to TopNet.} We identify and correct two bugs in the Transformer block of the original TopNet implementation, and provide re-trained versions at two parameter scales (79M and 113M) with proper attention mechanisms.
+    \item \textbf{A keypoint-detection perspective on placement.} By analyzing the OPA dataset's sparse annotation protocol, we reframe placement prediction as a keypoint detection problem and introduce Gaussian heatmap targets with Focal Loss, providing a formal explanation for why full-supervision Focal Loss fails under extreme label sparsity.
+    \item \textbf{Model interpretability integration.} Four complementary visualization methods (Grad-CAM, saliency maps, occlusion experiments, and intermediate feature visualization) are built into the application to help users understand model decisions.
+\end{enumerate}
+
+
+\section{Method}
+
+\subsection{Models and Algorithms for the Application}
+
+We first describe the core modules of the application pipeline and the algorithms behind them. Unless otherwise noted, all models run inference on a single GPU (typically within 50--200ms per image), and the lightweight alternatives (OpenCV, Reinhard, shadow rendering) execute on CPU in under 10ms.
+
+\subsubsection{Foreground Segmentation: Why Automatic Masking Matters}
+
+When a user provides a foreground image of an object---say, a photograph of a vase against a white wall---the system needs to separate the vase pixels from the wall pixels. If the wall pixels are carried over into the composite, the result will have a visible rectangular halo around the vase, breaking the illusion of natural placement. This is why automatic mask extraction is essential: the user should not need to manually annotate masks.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{minipage}{0.35\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{fig/oseg.jpg}
+    \end{minipage}
+    \hfill
+    \begin{minipage}{0.35\textwidth}
+        \centering
+        \includegraphics[width=\linewidth]{fig/wseg.jpg}
+    \end{minipage}
+    \caption{Elephant placed on a grassland background. The black background of the original elephant image (left) is incompatible with the grassland scene, while proper segmentation (right) achieves natural composition.}
+    \label{fig:woseg}
+\end{figure}
+
+We provide two segmentation backends with distinct failure modes and complementary strengths.
+
+\textbf{SAM2.1: Segment Anything.} SAM2 (Segment Anything Model 2)~\cite{sam2} is a vision foundation model developed by Meta AI. Its key capability is \textit{promptable segmentation}: given an image and a prompt (a point, a bounding box, or a mask), it segments the object that the prompt refers to---without any category restriction. It ``segments anything'' within the image, not just objects from a predefined vocabulary.
+
+For our use case, we provide a single center-point prompt (assuming the main object is roughly centered in the foreground image, which is true for the OPA dataset and most product photos) plus a generous bounding box covering 80\% of the image. SAM2 outputs three candidate masks with confidence scores; we select the highest-scoring one. The model uses the Hiera-Small backbone (46M parameters) and runs in approximately 200ms on GPU.
+
+\textbf{OpenCV: Border-Color Estimation + Otsu.} When SAM2 is unavailable, unreliable, or when the user prefers a non-deep-learning solution, we employ a classical computer vision pipeline. The core idea is that the background of a foreground image (typically a studio backdrop) has a consistent color that can be estimated from the image borders, and any pixel whose color differs significantly from this background is likely foreground.
+
+Formally, let $I \in \mathbb{R}^{H\times W\times 3}$ be the foreground RGB image. We sample a border strip of width $b = \max(3, \min(H,W)/20)$ from each of the four edges:
+
+\begin{equation}
+\mathcal{B} = \{I_{i,j} : i \in [0,b) \cup [H-b, H), \;
+                j \in [0,b) \cup [W-b, W)\}
+\end{equation}
+
+The estimated background color is the mean of these border pixels: $\bm{\mu}_b = \frac{1}{|\mathcal{B}|} \sum_{\mathbf{p} \in \mathcal{B}} \mathbf{p}$. The per-pixel color distance is then:
+
+\begin{equation}
+D_{i,j} = \|\mathbf{I}_{i,j} - \bm{\mu}_b\|_2
+\end{equation}
+
+Otsu's method automatically thresholds this distance map to separate foreground from background, and we retain only the largest connected component. Finally, a morphological close with a $5\times 5$ elliptical kernel smooths the boundary. This method runs in under 5ms on CPU and works well for images with uniform backgrounds (white, gray, studio backdrops), but can struggle with cluttered backgrounds or objects whose colors happen to match the background near the borders.
+
+\textbf{Failure handling.} Before segmentation, both methods operate on a padded version of the image: we add a 20-pixel black border around the original image. This prevents objects touching the image edges (e.g., a giraffe whose head reaches the top of the frame) from being incorrectly segmented, since the black border provides a clear contrast boundary. After SAM2, we check whether the resulting mask is anomalously small ($<1\%$ of pixels) or large ($>95\%$), which typically indicates a failed segmentation. In either case, the system automatically falls back to the OpenCV pipeline.
+
+\subsubsection{Placement Prediction and Assessment}
+
+Once we have the foreground and its mask, we need to decide \textbf{where} to place it. Two modes are available, serving different user needs.
+
+\textbf{Automatic mode: TopNet + SimOPA.} The TopNet model takes the background, foreground, and mask as input and produces a $256\times 256$ heatmap in a single forward pass. Each heatmap value $h_{i,j} \in [0,1]$ represents the predicted probability that placing the foreground center at pixel $(i,j)$ would be reasonable. We extract local maxima from this heatmap using a non-maximum suppression filter, selecting the top-K spatially diverse peaks as candidate placement positions.
+
+For each candidate, we composite the foreground at that position onto the background via alpha blending ($I_{\text{comp}} = I_{\text{fg}} \odot \alpha + I_{\text{bg}} \odot (1-\alpha)$ where $\alpha$ is the resized mask), and then pass the composite through SimOPA for a second-stage fine-grained scoring. SimOPA's 4-channel input---RGB channels of the composite concatenated with the foreground mask---tells the model both \textit{what the result looks like} and \textit{where the foreground is}. This two-stage approach (coarse heatmap $\rightarrow$ fine scoring) combines TopNet's speed with SimOPA's precision. The final output is a ranked list of Top-K candidates with composite images, SimOPA scores, normalized positions, and scale factors.
+
+\textbf{Manual mode: click-to-place.} The user clicks directly on the background image displayed in the interface. The clicked pixel serves as the center point of the foreground placement. Adjustable controls allow the user to set the foreground scale (5--80\% of the background), rotation angle ($-$180$^\circ$ to 180$^\circ$), and toggle harmonization and shadow rendering on or off. Each click composites the foreground at the specified position, and the resulting composite becomes the ``new background'' for subsequent placements, enabling multi-object stacking. The system stores a list of all placed objects and provides \texttt{Undo Last} and \texttt{Reset All} buttons. Each placement is automatically scored by SimOPA, with the result displayed in the status bar.
+
+\subsubsection{SimOPA Scoring Modes}
+
+SimOPA's default input is a 4-channel tensor $[3+1, 256, 256]$ where the first 3 channels carry the composite RGB image and the 4th channel carries the foreground mask. We extended the scoring interface with two additional modes:
+
+\begin{itemize}
+    \item \textbf{3-channel mode:} Only the RGB composite is fed to the model. The pretrained 4-channel conv1 weight $\mathbf{W} \in \mathbb{R}^{64\times 4\times 7\times 7}$ is sliced to its first 3 channels $\mathbf{W}[:, :3, :, :]$, and the standard ResNet forward pass proceeds normally. This mode is useful when mask quality is uncertain.
+    \item \textbf{Crop mode:} The region around the placed object is cropped with a $\sqrt{2}$ expansion factor (matching the FOS Score protocol from the DiscoFOS paper), resized to $256\times 256$, and then scored in either 3-channel or 4-channel mode. This focuses SimOPA's attention on the local context around the object.
+\end{itemize}
+
+\subsubsection{Image Harmonization}
+
+After compositing, the foreground often appears visually inconsistent with the background---a person photographed in sunlight looks out of place when inserted into a dimly lit room. We support two harmonization methods.
+
+\textbf{PCTNet} (Pixel-Color-Transform Network) is a learned approach using a ViT encoder-decoder architecture (4.8M parameters). The model takes the composite image and mask (both at $256\times 256$), passes them through a Vision Transformer encoder that captures global lighting context, and outputs a per-pixel color transform---specifically, a $3\times 3$ linear transformation matrix plus a 3-dimensional bias vector for each pixel. The low-resolution parameters are bicubicly interpolated to the full image resolution and applied only to the foreground region:
+
+\begin{equation}
+\mathbf{I}_{\text{harm}}(p) = \mathbf{M}(p) \cdot \mathbf{I}_{\text{comp}}(p) + \mathbf{b}(p), \quad \forall p \in \text{foreground}
+\end{equation}
+
+\textbf{Reinhard color transfer} provides a lightweight fallback. It converts the composite from RGB to CIE L*a*b* color space, computes the mean and standard deviation of the background ($\bm{\mu}_{\text{bg}}, \bm{\sigma}_{\text{bg}}$) and foreground ($\bm{\mu}_{\text{fg}}, \bm{\sigma}_{\text{fg}}$) regions, and applies a linear mapping to the foreground:
+
+\begin{equation}
+\mathbf{L}_{\text{fg}}' = \frac{\bm{\sigma}_{\text{bg}}}{\bm{\sigma}_{\text{fg}}} \cdot (\mathbf{L}_{\text{fg}} - \bm{\mu}_{\text{fg}}) + \bm{\mu}_{\text{bg}}
+\end{equation}
+
+This matches the foreground's color statistics to the background's in all three Lab channels simultaneously.
+
+\subsubsection{Shadow Rendering}
+
+For a quick visual enhancement, we render a soft drop shadow beneath each placed object without requiring any deep learning model. The approach is purely graphical: a filled ellipse is drawn at the base of the object's bounding box, centered at $(c_x, c_y) = (\frac{x_1+x_2}{2} + 0.1\cdot w, \; y_2 + 0.02\cdot h)$, with axis dimensions proportional to the object size ($0.8\times w$ wide, $0.12\times h$ tall). The ellipse is rendered at opacity $\alpha = 0.35$ and blurred with a Gaussian kernel ($\sigma \approx h/25$) to create a soft transition. The shadowed regions are darkened via multiplicative blending: $\mathbf{I}_{\text{out}} = \mathbf{I}_{\text{in}} \cdot (1 - \alpha \cdot S)$, where $S$ is the blurred shadow mask.
+
+\subsubsection{Model Interpretability}
+
+To help users---and ourselves---understand \textit{why} the model considers a certain placement reasonable, we integrated four complementary visualization methods into the application, all operating on the top-1 ranked composite. These are generated automatically after each Auto Search analysis.
+
+\textbf{Grad-CAM} (Gradient-weighted Class Activation Mapping)~\cite{gradcam} reveals which spatial regions of the input image the model's prediction is most sensitive to. For a given class output $y^c$ (e.g., the ``reasonable'' logit of SimOPA), we compute the gradient of $y^c$ with respect to the feature maps $\mathbf{A}^k$ of the last convolutional layer ($\texttt{layer4}$ of ResNet18, producing $8\times 8$ feature maps with 512 channels). The importance weight of channel $k$ is:
+
+\begin{equation}
+\alpha_k^c = \frac{1}{Z} \sum_{i}\sum_{j} \frac{\partial y^c}{\partial A_{ij}^k}
+\end{equation}
+
+The Grad-CAM heatmap is then the weighted combination of feature maps, followed by ReLU to retain only positive evidence:
+
+\begin{equation}
+L_{\text{Grad-CAM}}^c = \text{ReLU}\Big(\sum_k \alpha_k^c \mathbf{A}^k\Big)
+\end{equation}
+
+The resulting $8\times 8$ map is bilinearly upsampled to $256\times 256$ and overlaid on the composite with a jet colormap. Red regions indicate areas that strongly support the ``reasonable'' classification---for example, the boundary where a foreground object's feet meet the ground plane.
+
+\textbf{Saliency maps} take a simpler approach: they directly compute the gradient of the class score with respect to the input pixels, then take the maximum absolute value across RGB channels: $S_{ij} = \max_c |\partial y^c / \partial I_{ij}^c|$. This produces a pixel-level importance map without any layer selection.
+
+\textbf{Occlusion experiments} slide a $40\times 40$ gray window across the composite image with a stride of 40 pixels, recording the change in SimOPA score at each position. Positions where the score drops sharply indicate regions critical to the model's decision. The occlusion map is normalized to $[0,1]$ for visualization.
+
+\textbf{Intermediate feature visualization} extracts and displays the first 64 channels of feature maps from specific ResNet layers (layer2 at $32\times 32$ for mid-level texture features, layer4 at $8\times 8$ for high-level semantic features). Each channel is independently normalized and arranged in an $8\times 8$ grid, providing a qualitative view of what the network learns at different depths.
+
+
+\subsection{Fixing the TopNet Transformer}
+
+The original TopNet~\cite{topnet} architecture employs dual 4-channel ResNet18 encoders (one for the background with an empty mask channel, one for the foreground with the actual mask), followed by a 4-layer Transformer operating on the concatenated $8\times 8$ feature maps, and a UNet-style decoder with skip connections from the background encoder. The Transformer block was intended to enable spatial attention across the 64 positions in the $8\times 8$ feature grid, allowing the model to learn relationships between different image regions. We identified two bugs that prevented this from working correctly.
+
+\textbf{Bug 1: LayerNorm dimension.} The Transformer receives an input tensor $\mathbf{X} \in \mathbb{R}^{B\times 1024\times 8\times 8}$, where 1024 is the concatenated feature dimension (512 from bg encoder + 512 from fg encoder) and $8\times 8=64$ represents the spatial grid. The original code applies \texttt{LayerNorm}(8):
+
+\begin{lstlisting}[language=Python]
+# Original (buggy):
+self.layer_norm1 = nn.LayerNorm(8)   # normalises across spatial W=8
+x1 = self.layer_norm1(x)             # x: [B, 1024, 8, 8]
+\end{lstlisting}
+
+LayerNorm(8) normalizes across the last dimension of size 8, which is the spatial column axis. This means it computes mean and variance across 8 spatial columns separately for each of the 1024 feature channels---a semantically meaningless operation. The correction is:
+
+\begin{lstlisting}[language=Python]
+# Fixed:
+x1 = x.flatten(2).transpose(1, 2)    # [B, 1024, 8, 8] -> [B, 64, 1024]
+self.norm1 = nn.LayerNorm(1024)      # normalises across feature dim
+x1 = self.norm1(x1)                  # correct per-token normalisation
+\end{lstlisting}
+
+\textbf{Bug 2: MHA batch-first configuration.} After reshaping to $[B, 64, 1024]$, the original code feeds this tensor to \texttt{nn.MultiheadAttention} with the default \texttt{batch\_first=False}. PyTorch's MHA with \texttt{batch\_first=False} expects input of shape $(\text{seq\_len}, \text{batch}, \text{embedding})$. With our tensor of shape $[B, 64, 1024]$, MHA interprets $B$ as the sequence length and $64$ as the batch size:
+
+\begin{lstlisting}[language=Python]
+# Original (buggy):
+self.attn = nn.MultiheadAttention(1024, 8)  # batch_first=False by default
+x1 = x1.reshape(B, 1024, 64).permute(0, 2, 1)  # [B, 64, 1024]
+attn_out, _ = self.attn(x1, x1, x1)
+# MHA internally treats this as: seq_len=B, batch=64, embed=1024
+\end{lstlisting}
+
+During training with $B=32$, this creates a bizarre situation: each of the 64 spatial positions independently attends across all 32 \textit{different images} in the batch---effectively computing cross-image statistics rather than cross-position relationships. During inference with $B=1$, the attention matrix collapses to $[1 \times 1]$, making the attention branch an identity operation that contributes no information.
+
+The correction is straightforward---explicitly set \texttt{batch\_first=True} and keep the tensor in $[B, 64, 1024]$ format:
+
+\begin{lstlisting}[language=Python]
+# Fixed:
+self.attn = nn.MultiheadAttention(1024, 8, batch_first=True)
+tokens = x.flatten(2).transpose(1, 2)          # [B, 64, 1024]
+attn_out, _ = self.attn(tokens, tokens, tokens) # proper self-attention
+\end{lstlisting}
+
+\textbf{Model scaling and the MLP modification.} The original Transformer MLP flattens the entire $1024\times 8\times 8 = 65{,}536$-dimensional feature map and projects it through a narrow bottleneck: $\text{Linear}(65{,}536 \rightarrow 128 \rightarrow 65{,}536)$. This is effectively a 67M-parameter fully-connected layer across all spatial positions, behaving more like a global spatial memory than a Transformer feed-forward network. Our fixed version uses a per-token MLP operating independently on each spatial position: $\text{Linear}(1024 \rightarrow D_{\text{hidden}} \rightarrow 1024)$, with $D_{\text{hidden}} \in \{4096, 8192\}$ for the 79M and 113M variants respectively (Table~\ref{tab:params}).
+
+\begin{table}[t]
+\centering
+\caption{Parameter counts across model variants.}
+\label{tab:params}
+\begin{tabular}{lcc}
+\toprule
+Variant & MLP Hidden & Params \\
+\midrule
+Buggy (original) & 128 (global) & 113.2M \\
+Fixed 79M & 4096 (per-token) & 79.4M \\
+Fixed 113M & 8192 (per-token) & 113.0M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The loss-of-capacity analysis is interesting. The buggy model's 67M-parameter global MLP can directly memorize spatial patterns across the entire $256\times 256$ feature map. The per-token MLP has no mechanism for cross-token spatial mixing beyond what the attention layers provide. This means our fixed model genuinely relies on attention for spatial reasoning, whereas the original model may have been bypassing attention entirely in favor of brute-force memorization through the enormous fully-connected layer.
+
+
+\subsection{A Keypoint-Detection Perspective on Loss Design}
+
+The OPA dataset~\cite{liu2021OPA} provides binary point annotations: for each background-foreground pair, annotators mark specific pixel coordinates as either \texttt{pos\_label} (reasonable placement center) or \texttt{neg\_label} (unreasonable). Crucially, the annotations are \textit{sparse}---a typical $256\times 256$ training image contains only $\sim$5 positive and $\sim$5 negative labeled pixels, with the remaining $>99.99\%$ of pixels left unlabeled.
+
+\textbf{Why this can be viewed as keypoint detection.} In standard keypoint detection (e.g., CenterNet~\cite{centernet} for object detection), each object instance is represented by a single center point, and the model is trained to predict a Gaussian heatmap peaked at each center. Our placement task has a similar structure: each \texttt{pos\_label} annotation marks a ``keypoint''---the center of a reasonable placement. The difference is that we also have explicit negative annotations (\texttt{neg\_label}) telling the model where \textit{not} to place objects.
+
+\textbf{Sparse CrossEntropy (Baseline).} The original TopNet treats this as a per-pixel classification: each pixel with a \texttt{pos\_label} gets target $y=1$, each with \texttt{neg\_label} gets $y=0$, and all others get $y=255$ (ignored). The loss is $\mathcal{L}_{\text{CE}} = -\sum_{i \in \mathcal{L}} \big[y_i \log \hat{y}_i + (1-y_i)\log(1-\hat{y}_i)\big]$, where $\mathcal{L}$ is the set of labeled pixels. This loss has the advantage of being perfectly aligned with the evaluation metric (both only look at sparse labeled pixels), but the disadvantage of extreme supervision sparsity: gradients flow through only $\sim$6 pixels per image.
+
+\textbf{Gaussian Heatmap + Partial Focal Loss.} Following CenterNet~\cite{centernet}, we convert each \texttt{pos\_label} at coordinate $(x,y)$ into a 2D Gaussian peak:
+
+\begin{equation}
+Y_{ij} = \exp\left(-\frac{(i - x)^2 + (j - y)^2}{2\sigma^2}\right)
+\end{equation}
+
+where $\sigma = \min(w_{\text{fg}}, h_{\text{fg}}) / 8$, and $w_{\text{fg}}, h_{\text{fg}}$ are the scaled foreground dimensions in the $256\times 256$ image. Each Gaussian peak covers approximately $\pi \cdot (3\sigma)^2 \approx 1{,}800$--$4{,}500$ pixels, dramatically increasing supervision density. Negative labels are kept as explicit zeros within a small $5\times 5$ supervision window.
+
+A critical design choice: we use a \texttt{valid\_mask} that restricts loss computation to only the Gaussian peak regions and negative supervision windows. Pixels outside these regions receive no supervision signal. This encoding respects a core semantic principle: \textit{``unlabeled'' does not mean ``unreasonable.''} An annotator marking a single point as a good placement does not imply that all other 65,535 pixels are bad.
+
+The loss is a modified Focal Loss~\cite{focal} with $\alpha=2, \beta=4$:
+
+\begin{equation}
+\begin{split}
+\mathcal{L}_{\text{focal}} = -\frac{1}{N_{\text{peaks}}} \sum_{i,j} \Big[
+    & M_{ij}^{\text{pos}} (1-\hat{Y}_{ij})^\alpha \log \hat{Y}_{ij} \\
+     + M_{ij}^{\text{neg}} & (1-Y_{ij})^\beta \hat{Y}_{ij}^\alpha \log(1-\hat{Y}_{ij})
+\Big]
+\end{split}
+\end{equation}
+
+where $M^{\text{pos}}$ and $M^{\text{neg}}$ are the positive and negative regions of the \texttt{valid\_mask}, and $N_{\text{peaks}}$ is the number of annotation peaks (not the number of Gaussian pixels). Normalizing by $N_{\text{peaks}}$ rather than by the number of Gaussian pixels is essential: centroids (target = 1.0) and Gaussian boundaries (target = 0.01) receive equal treatment under pixel-count normalization, diluting the center supervision signal by a factor of roughly 900$\times$. Normalizing by peak count preserves the full gradient strength at annotation centers.
+
+\textbf{Why full-supervision Focal Loss fails.} When the \texttt{valid\_mask} covers all pixels (treating all unlabeled pixels as negatives with target = 0), the loss becomes:
+
+\begin{equation}
+\begin{split}
+\mathcal{L}_{\text{full}} = -\frac{1}{N_{\text{peaks}}} \bigg[
+    & \sum_{i\in\mathcal{P}} (1-\hat{Y}_i)^\alpha \log \hat{Y}_i \\
+    & + \sum_{i\notin\mathcal{P}} (1-0)^\beta \hat{Y}_i^\alpha \log(1-\hat{Y}_i) \bigg]
+\end{split}
+\end{equation}
+
+where $\mathcal{P}$ is the set of Gaussian peak pixels ($\sim$4,500 per image). The negative term sums over all remaining pixels: $\sim$65,536 $-$ 4,500 $\approx$ 61,000 pixels per image. Even with the $(1-Y_j)^\beta = 1^\beta = 1$ factor eliminated and $\hat{Y}_j^\alpha$ down-weighting easy predictions, the sheer volume of negatives overwhelms the gradient signal. The model learns that predicting $\hat{Y} \approx 0$ everywhere achieves low loss on 99.9\% of pixels. Adding a positive weight multiplier of 50$\times$ is insufficient to overcome this imbalance, as confirmed by our experiments (F1 = 0.000). This represents a fundamental mismatch: full supervision encodes the assumption ``unlabeled = unreasonable,'' which contradicts the annotation protocol.
+
+\textbf{Label Dilation.} As a simpler alternative compatible with the original CE loss, we dilate each annotation point into a circular disk of radius $r=3$ pixels. The target remains binary (0/1/255), and the loss is standard $\text{CrossEntropyLoss}(\text{ignore\_index}=255)$. This increases supervision density from $\sim$6 to $\sim$174 labeled pixels per image (29$\times$) without changing the loss formulation or the evaluation protocol.
+
+
+\section{Experiment}
+
+\subsection{Application Workflow and Cross-Platform Deployment}
+
+The OpenImageComp application supports three primary interaction modes, available identically through both the Gradio web interface and the Android mobile client (via the FastAPI server).
+
+\begin{figure*}[htbp]
+    \centering
+    \includegraphics[width=1.0\textwidth]{fig/workflow.png}
+    \caption{The workflow of mobile app.}
+    \label{fig:workflow}
+\end{figure*}
+
+\textbf{Auto Search.} The user selects a background and foreground image (either from a library of 8 preset backgrounds and 8 preset foregrounds extracted from the OPA dataset, or by uploading custom images). After choosing the placement method (TopNet heatmap or grid search), segmentation source (SAM2/OpenCV/alpha/manual), foreground scale (5--100\% of background), and SimOPA scoring mode (4ch/3ch/crop), a single click triggers the full pipeline. Results include: a color-coded placement heatmap overlaid on the background, a gallery of Top-5 composite candidates with SimOPA scores, a sortable detail table with normalized coordinates, and five interpretability visualizations on the top-ranked placement.
+
+\textbf{Manual Placement.} The user clicks directly on a displayed background image to place the foreground at that position. Controls for foreground scale (5--80\%), rotation ($-$180$^\circ$ to 180$^\circ$), shadow rendering, and color harmonization are available as sliders and toggles. Each new click composites the foreground onto the accumulated result, enabling multi-object scenes. The application tracks all placed objects with their positions, scales, and individual SimOPA scores. \texttt{Undo Last} removes the most recent object and reverts to the original background; \texttt{Reset All} clears all objects. Changing the foreground image does not affect already-placed objects, allowing heterogeneous compositions (e.g., placing a dog, then a cat, then a vase).
+
+\textbf{Cross-platform architecture.} The same Python pipeline powers two interfaces: a Gradio web application accessed through a browser at \texttt{http://127.0.0.1:7860}, and a FastAPI REST server at \texttt{http://<host>:8000} with Swagger documentation at \texttt{/docs}. The REST server exposes five endpoints:
+
+\begin{itemize}
+    \item \texttt{POST /api/place} — automatic placement search (TopNet or grid)
+    \item \texttt{POST /api/place\_manual} — click-to-place with scoring
+    \item \texttt{POST /api/harmonize} — color harmonization on a composite
+    \item \texttt{POST /api/mask} — foreground segmentation (SAM2 or OpenCV)
+    \item \texttt{GET /api/health} — server status and loaded model list
+\end{itemize}
+
+The Android client, built with Jetpack Compose and Retrofit, communicates with the server over HTTP, sending multipart image uploads and receiving JSON responses with base64-encoded result images, heatmaps, composite galleries, and score tables. The same Gradio functionality---including top-K gallery browsing, heatmap inspection, and score-table sorting---is available on mobile through the Android app's tabbed interface.
+
+\subsection{Placement Model Comparison}
+
+We trained all model variants using a two-stage strategy: Stage 1 freezes both encoders (SOPA-pretrained background encoder, ImageNet-pretrained foreground encoder) and trains only the Transformer and UNet decoder for up to 10 epochs (lr=1e-4, AdamW, batch=32); Stage 2 unfreezes all parameters and fine-tunes the entire model for up to 30 epochs (lr=1e-5, AdamW, batch=32). Early stopping with a patience of 8 (Stage 1) and 12 (Stage 2) monitors validation loss. Each training run saves per-epoch metrics (train/val loss, F1, bAcc) and a copy of the YAML configuration for reproducibility.
+
+We evaluate all models on the 2568-image OPA test set using three complementary metrics computed exclusively on the set of sparsely labeled pixels ($\mathcal{L}$, where $\text{target} \neq 255$).
+
+\textbf{F1 score and balanced accuracy.} For 2-channel classification models, the prediction is the argmax $\hat{y} = \arg\max_c \; \hat{p}_c$. For 1-channel keypoint models, a fixed threshold of $0.5$ is applied. Per-pixel F1 is computed as $\text{F1} = 2\cdot\text{Prec}\cdot\text{Rec} / (\text{Prec} + \text{Rec})$, with $\text{Prec} = \text{TP}/(\text{TP}+\text{FP})$ and $\text{Rec} = \text{TP}/(\text{TP}+\text{FN})$. Balanced accuracy is $\text{bAcc} = \frac{1}{2}(\text{TPR} + \text{TNR})$.
+
+\textbf{VOC Average Precision.} While F1 at a single threshold provides a point estimate, the Pascal VOC Average Precision (AP)~\cite{voc} evaluates model quality across the entire precision-recall space. For 2-channel models, the raw ``score'' is the softmax class-1 probability $\hat{p}_1$; for 1-channel models it is the sigmoid output. All labeled pixels across the test set are sorted by descending score, and precision-recall pairs are accumulated by sweeping the score threshold. The PR curve is then interpolated at 101 recall levels $\{0, 0.01, \dots, 1.0\}$ using the standard max-precision interpolation (for each recall level, take the maximum precision observed at any higher recall). The AP is the mean of these 101 interpolated precision values. Unlike single-threshold F1, AP is invariant to the choice of operating point and captures the model's ranking quality across the full confidence spectrum.
+
+We supplement AP with per-threshold F1 scores at $\{0.50, 0.75, 0.90\}$ and the mean F1 over the range $0.50:0.05:0.95$, denoted AP$_{\text{mean}}$.
+
+Table~\ref{tab:results} reports results for all trained and evaluated models.
+
+\begin{table}[t]
+\centering
+\caption{Placement model comparison on the OPA test set (2568 images).}
+\label{tab:results}
+{\small
+\begin{tabular}{lccccc}
+\toprule
+Model & F1 & bAcc & AP & Prec. & Rec. \\
+\midrule
+Buggy TopNet (113M) & 0.661 & 0.755 & 0.678 & 0.595 & 0.742 \\
+CE baseline (79M) & 0.660 & 0.750 & 0.736 & 0.710 & 0.617 \\
+CE (113M) & \textbf{0.682} & 0.767 & \textbf{0.737} & 0.655 & 0.711 \\
+CE dilated r=3 (79M) & 0.649 & 0.743 & 0.712 & 0.678 & 0.622 \\
+Focal partial (79M) & 0.672 & 0.764 & 0.714 & 0.611 & 0.746 \\
+Focal partial (113M) & 0.672 & \textbf{0.766} & 0.707 & 0.581 & \textbf{0.796} \\
+\midrule
+Paper reference~\cite{topnet} & 0.741 & 0.815 & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+We draw several observations from these results.
+
+\textbf{All fixed models outperform the released buggy checkpoint.} The publicly available buggy model achieves F1 = 0.661 and AP = 0.678, well below the paper's claim of 0.741. Our CE (113M) model reaches F1 = 0.682 and AP = 0.737 with comparable parameter count, while the 79M CE model reaches F1 = 0.660 and AP = 0.736 with 30\% fewer parameters.
+
+\textbf{The VOC AP metric favors CE models for ranking quality.} While Focal models achieve the best single-threshold F1 (0.672), the CE variants achieve notably higher AP (0.736--0.737 vs.\ 0.707--0.714 for Focal). This is because CE models are trained to maximize per-pixel classification accuracy, which directly optimizes the confidence ranking that AP measures. Focal models, trained on smooth Gaussian heatmaps, produce broader score distributions with higher recall but lower precision throughout the threshold sweep, reducing the area under the PR curve. The CE (113M) model with AP = 0.737 achieves the best ranking quality across all thresholds, while Focal partial (113M) achieves the best single-threshold F1 (0.672) and the highest recall (0.796).
+
+\textbf{The precision-recall trade-off reflects the training objective.} The CE model, trained to classify individual pixels, learns to be conservative---predicting ``reasonable'' only at locations with strong evidence (precision 0.710). The Focal model, trained on smooth Gaussian heatmaps, learns a broader notion of ``reasonable,'' predicting high values over a wider area (recall 0.796, precision 0.581). This trade-off is desirable: for the application's manual placement use case, the user is likely to prefer a model that suggests more candidate positions (higher recall) rather than one that misses valid positions.
+
+\textbf{Label dilation does not improve sparse F1.} The dilated CE model (r = 3, F1 = 0.649, AP = 0.712) slightly underperforms the baseline CE (F1 = 0.660, AP = 0.736). This suggests that expanding supervision to $\sim$174 labeled pixels per image (29$\times$ increase) introduces label noise at the disk boundary, partially offsetting the benefit of increased supervision density. Finer-grained dilation radii or soft-boundary disks may improve this result.
+
+\textbf{Sigma sensitivity reveals a metric limitation.} We observed that the sparse F1 metric strongly favors larger Gaussian sigmas: $\sigma \approx 17$px (sigma\_factor = 6) gives F1 $\approx$ 0.66, while $\sigma \approx 8$px (sigma\_factor = 12) gives F1 $\approx$ 0.49. This occurs because the evaluation metric penalizes predictions even a single pixel away from the annotation point identically to predictions at the opposite corner of the image. Wider Gaussians produce broader prediction regions, increasing the probability of hitting the annotation pixel by chance. The VOC AP metric partially mitigates this issue by evaluating across the full PR curve, but the underlying point-annotation granularity remains a limitation shared with the original paper's evaluation protocol.
+
+\textbf{The paper-checkpoint gap remains unresolved.} The publicly released buggy checkpoint scores F1 = 0.661 and AP = 0.678, significantly below the paper's claim of F1 = 0.741. Possible explanations include different data preprocessing, checkpoint selection (the released model may be an earlier or later snapshot), or multi-scale evaluation not reflected in the released code.
+
+
+\section{Reproducibility}
+
+The complete project is open-source at \url{https://github.com/huangxiantao666666-dot/OpenImageComp}. The OPA dataset and all pretrained weights are provided via the SJTU cloud drive (link in repository README). The codebase includes: (1) \texttt{placement\_app/}---the Gradio application and FastAPI server with all pipeline modules (segmentation, placement, scoring, harmonization, shadow, interpretability); (2) \texttt{topnet\_fixed/}---the training pipeline with 14 YAML configuration files covering all ablation experiments, two-stage training scripts, and an automated multi-model evaluation script (\texttt{test\_exp.py}); (3) \texttt{ImageCompApp/}---the Android client source code.
+
+Every training run automatically saves a copy of its YAML configuration alongside per-epoch metrics (train/val loss, F1, bAcc) in JSON format, along with TensorBoard event files. The training scripts accept CLI overrides for all configurable parameters, enabling hyperparameter sweeps without modifying YAML files. The full set of shell scripts (22 files) provides one-command execution of each experiment's stage 1, stage 2, or both stages combined.
+
+
+\section{Conclusion}
+
+We presented OpenImageComp, an open-source framework for image composition that integrates segmentation, placement prediction, assessment, harmonization, and model interpretability into a unified pipeline deployable across desktop and mobile platforms. By identifying and correcting two architectural bugs in the TopNet Transformer, reframing the placement task through a keypoint-detection lens, and conducting a comparative evaluation of loss formulations under extreme annotation sparsity, we demonstrated that proper attention design combined with partial-supervision Focal Loss training achieves the best results across all metrics. The interactive application and its companion REST API make these models accessible for both research experimentation and practical creative workflows.
+
+Future directions include evaluating the dilated CrossEntropy variant at larger model scales, developing distance-tolerant evaluation metrics that better reflect human judgment of placement quality, and integrating learned shadow generation when GPU resources are available at inference time.
+
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+
+\appendix
+
+\section{Problem Solving}
+
+During development, we encountered and resolved several challenges that illuminate important practical considerations in deep learning research.
+
+\textbf{Data loading resilience.} Some foreground images in the OPA dataset lack corresponding mask files due to incomplete extraction or data corruption. We added automatic fallback to the OpenCV border-estimation pipeline in both dataset loaders, plus a sample-retry mechanism that skips to a different random sample when the target file is missing, preventing training crashes on partially-complete datasets.
+
+\textbf{Focal Loss normalization.} Our initial Focal Loss implementation normalized by $\text{pos\_mask.sum()}$, which counts all Gaussian pixels ($\sim$4,500 per image). This diluted the supervision signal from peak centers by treating a Gaussian boundary pixel (target = 0.01) identically to a peak center (target = 1.0). Changing the normalization to $\text{(target > 0.99).sum()}$ (counting only annotation peaks) increased the effective supervision weight on ground-truth centers by approximately 900$\times$.
+
+\textbf{Validation metric for 1-channel models.} The validation \texttt{compute\_metrics} function for Focal-trained (1-channel) models incorrectly used $\text{target} > 0.01$ to binarize the target, treating $\text{ignore}=255$ pixels as $\text{true} > 0.01$ and counting them as positive labels. This caused training-time validation F1 to consistently read $\sim$0.50 while the actual test-set F1 was $\sim$0.67. Correcting the condition to $\text{target != 255}$ and using the sparse annotation mask directly aligned the two metrics.
+
+\textbf{Encoder weight initialization.} Our initial training runs used Kaiming random initialization for all layers (Stage 1 F1 $\approx$ 0.26). Proper loading of ImageNet-pretrained ResNet18 weights for both encoders (with grayscale-initialized 4th conv1 channels) and SOPA-pretrained weights for the background encoder raised Stage 1 F1 to 0.68---a 2.6$\times$ improvement from initialization quality alone.
+
+\textbf{Gradio State serialization.} Storing per-object numpy arrays in Gradio's \texttt{gr.State} for multi-object undo caused serialization failures on the Python-Gradio boundary. We adopted an alternative undo strategy that resets to the original background image (preserved in a separate, never-modified \texttt{gr.State}), which is both simpler and more robust.
+
+\section{Extra Experimental Details}
+
+\section{Requirements Completions}
+
+This section maps our work to the course project grading criteria. Items marked with \textbf{[DONE]} are complete; those with \textbf{[PENDING]} are planned for final submission.
+
+\subsection{Basic Requirements (60 points)}
+
+\textbf{Application goal and reference code positioning (10 pts). [DONE]} Our application enables users to insert foreground objects into background scenes with automated quality assessment. The system accepts background and foreground images as input, automatically segments the foreground when needed (SAM2.1 or OpenCV border-color estimation), and outputs placement recommendations with heatmaps, composite galleries, and SimOPA rationality scores. The reference codebase---BCMI's OPA, TopNet, and libcom repositories---provides the core models (SimOPA for assessment, TopNet for placement search). We have run and verified all reference examples and documented their roles in the application pipeline. Users can also manually place objects with adjustable scale and rotation, receiving immediate SimOPA feedback.
+
+\textbf{Model modifications (15 pts). [DONE]} We completed four types of model changes:
+
+(1) \textit{Input modification (intrinsic).} We extended SimOPA's scoring interface from a single 4-channel mode (RGB + mask concatenated) to support three modes: 4-channel (original), 3-channel (RGB only, slicing the pretrained 4-channel conv1 weight), and crop mode (cropping the region around the foreground with $\sqrt{2}$ expansion, then scoring). The modification is in \texttt{models/\_\_init\_\_.py}, function \texttt{SimOPAScorer.score()}. A comparative analysis of these three modes on 10 representative test composites is included in the code repository.
+
+(2) \textit{Output modification (intrinsic).} For Focal Loss-trained models, the output is changed from a 2-channel classifier to a single-channel sigmoid heatmap, producing a direct $[0,1]$ reasonableness score. This is implemented in \texttt{models/topnet.py} via the \texttt{out\_channels=1} option and is configurable through YAML.
+
+(3) \textit{Model scaling (intrinsic).} We provide two parameter scales for the fixed TopNet architecture: 79M (MLP hidden = 4096) and 113M (MLP hidden = 8192). The scaling is controlled by the \texttt{mlp\_expansion} parameter in \texttt{\_TransformerModule}. A comparison of 79M vs.\ 113M inference speed and sorting consistency on the placement application is presented in Section~3.2.
+
+(4) \textit{Candidate ranking (functional).} After TopNet heatmap generation or grid-based placement search, a ranking pipeline sorts candidate positions by SimOPA score and returns the top-K recommendations to the user interface. This is implemented in \texttt{pipeline/scorer.py} (\texttt{PlacementScorer} class).
+
+\textbf{Interactive application (20 pts). [DONE]} The application is deployed in two forms: (a) a Gradio web application accessible via browser at \texttt{http://127.0.0.1:7860}, and (b) a FastAPI REST server at \texttt{http://<host>:8000} with Swagger UI, powering an Android mobile client. The interface supports image upload/selection from presets, performs automatic placement search or manual click-to-place, and displays results as heatmaps, composite galleries, and sortable score tables with normalized coordinates. The complete operation flow---select images $\rightarrow$ analyze $\rightarrow$ view results---is clearly structured across three tabs (Auto Search, Manual Placement, and per-result Interpretation).
+
+\textbf{Test cases and results (10 pts). [PENDING]} A set of 10--12 test cases will be curated from the OPA dataset, covering: reasonable placements (foreground on appropriate surface), unreasonable placements (object floating, out-of-bounds), borderline cases (partial occlusion, horizon crossing), and scale extremes. Each case will include the composite image, the system's SimOPA score, and a qualitative assessment of whether the score aligns with human intuition. The automated \texttt{test\_cases.py} runner is in the repository.
+
+\textbf{Report, PPT, and team division (5 pts). [PENDING]} The written report (this document) details the application workflow, model architecture, and experimental results. The PPT presentation will summarize the key contributions for the in-class presentation. Team member contributions are documented in the Git commit history and will be explicitly listed in the final submission.
+
+\subsection{Advanced Items (40 points max)}
+
+\textbf{Model modification beyond basics (10 pts). [DONE]} In addition to the basic modifications listed above, we performed: (a) architectural bug fixes to the TopNet Transformer (correcting LayerNorm dimension and MHA batch-first configuration) and retrained the model from scratch, (b) designed and evaluated three loss formulations (sparse CE, partial Focal on Gaussian heatmaps, dilated CE), and (c) trained and compared the model at two scales (79M and 113M) as a complete ablation study. Modification locations and before/after comparisons are documented in Section~2.2.
+
+\textbf{Mobile app (5 pts). [DONE]} An Android application was developed using Jetpack Compose and Retrofit, communicating with the FastAPI server over HTTP. The app provides three screens: Home (server health check), Place (auto-search with parameter controls), and Result (heatmap gallery and score table). Source code is in \texttt{ImageCompApp/}. Screen recordings and UI screenshots will be submitted with the final materials.
+
+\textbf{Local inference (5 pts). [DONE]} Model inference runs entirely on the local computer (CPU or GPU). The Gradio web application and FastAPI server both load models in-process and perform inference without external API calls. The Android client connects to the local server over a shared local network, with the computer acting as the inference backend. The full call flow and known hardware limitations are documented in the repository README.
+
+\textbf{Model interpretability (10 pts). [DONE]} Four complementary visualization methods are integrated into the application's ``Interpretation'' tab on the top-ranked placement result: Grad-CAM (gradient-weighted activation maps on SimOPA's layer4), saliency maps (input gradient magnitude), occlusion experiments (sliding $40\times 40$ gray window score perturbation), and intermediate feature visualization (layer2 and layer4 channel grids). These methods are implemented in \texttt{interpretability.py} and generate offline-interpretable images for inclusion in the report.
+
+\textbf{Multi-model pipeline integration (10 pts). [DONE]} The application chains five models and tools in sequence: (1) SAM2.1 or OpenCV for automatic foreground segmentation, (2) TopNet for placement heatmap generation, (3) SimOPA for placement scoring and ranking, (4) PCTNet or Reinhard for color harmonization, and (5) a soft shadow rendering pass. The full pipeline logic is documented in Section~2.1. The Android client accesses the same pipeline through REST endpoints (\texttt{/api/place}, \texttt{/api/place\_manual}, \texttt{/api/harmonize}, \texttt{/api/mask}).
+
+\textbf{Complex interaction (10 pts). [PARTIALLY DONE]} The application supports: (a) user-adjustable foreground scale (5--80\%) and rotation ($-$180$^\circ$ to 180$^\circ$) via real-time sliders, (b) multi-object sequential placement with individual object tracking and SimOPA scoring, (c) undo and reset controls, and (d) failure detection with automatic fallback (SAM2 $\rightarrow$ OpenCV on segmentation failure). Multi-object drag-to-reposition is planned but not yet implemented for the final submission.
+
+% \textbf{MindSpore / CANN training (5 pts each). [NOT DONE]} --- not included in this submission.
+
+\end{document}

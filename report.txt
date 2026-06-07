@@ -1,0 +1,144 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{times}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{multirow}    % \multirow 和 \multirowcell
+\usepackage{booktabs}    % \toprule, \midrule, \bottomrule
+\usepackage{fontawesome5}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    frame=single,
+    breaklines=true,
+    breakatwhitespace=true,
+    columns=fullflexible,
+    backgroundcolor=\color{gray!5},
+    xleftmargin=2mm,
+    xrightmargin=2mm
+}
+
+% ICML-style title
+\makeatletter
+\renewcommand{\maketitle}{%
+  \twocolumn[%
+    \begin{center}
+    {\LARGE\bfseries \@title \par}
+    \vspace{0.5em}
+    {\large \@author \par}
+    \vspace{1em}
+    \end{center}
+  ]
+}
+\makeatother
+
+\title{OpenImageComp: Open Image Compostion Framework Based on Segmentation, Placement, Assessment and Harmonization}
+\author{
+  Xiantao Huang, Xiangshi Li, Yucheng Li, Haohua Zhao$^*$ \\
+  Shanghai Jiao Tong University \\
+  % $^2$Company Name, Location \\
+  {\small $^*$Corresponding Author}
+    \begin{center}
+    \faGithub \quad \url{https://github.com/huangxiantao666666-dot/OpenImageComp}
+    \end{center}
+}
+\date{}
+
+\makeatletter
+\renewenvironment{abstract}
+{%
+  \if@twocolumn
+    \vskip\parskip
+    \par\noindent
+    \hspace*{\fill}{\large\bfseries\scshape Abstract}\hspace*{\fill}%
+    \par\vspace{0.5em}
+    \begin{quote}
+  \else
+    \centerline{\large\bfseries\scshape Abstract}%
+    \begin{quote}
+  \fi
+}
+{%
+  \end{quote}
+}
+\makeatother
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a basic paper template and submission guidelines for ICML 2026. Abstracts must be a single textbf, ideally between 4--6 sentences long. The main text is limited to 8 pages, with unlimited pages for references and appendices.
+\end{abstract}
+
+
+\section{Introduction}
+
+\section{Method}
+\subsection{Models and Algorithms for App}
+\subsection{Model of Fixed TopNet}
+\subsection{Loss: A Keypoint Detection View}
+
+\section{Experiment}
+
+\subsection{Building App Workflow}
+
+\subsection{Comparison Studies}
+
+\section{Reproducibility}
+
+\section{Conclusion}
+
+    
+
+
+% Present comprehensive experimental results:
+
+
+
+% \section{Accessibility \& Reproducibility}
+
+% For reproducibility, we encourage linking to an anonymized code repository (e.g., Anonymous GitHub) during review.
+
+% \section{Conclusion}
+% % \begin{table}[t]
+% % \centering
+% % \caption{Results on benchmark datasets.}
+% % \begin{tabular}{lcc}
+% % \toprule
+% % Method & Dataset A & Dataset B \\
+% % \midrule
+% % Baseline & 78.3 & 82.1 \\
+% % Prior Work & 81.2 & 84.5 \\
+% % Ours & \textbf{85.7} & \textbf{88.2} \\
+% % \bottomrule
+% % \end{tabular}
+% % \end{table}
+
+% Summarize contributions and discuss future directions.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+
+\appendix
+
+
+\section{More Experimental Results}
+
+\section{Problem Solving}
+
+\section{Summary of Completions}
+
+
+\end{document}
