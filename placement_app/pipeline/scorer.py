@@ -22,25 +22,24 @@ class PlacementScorer:
 
     def score_candidates(self, bg: Image.Image, fg: Image.Image,
                          fg_mask: Image.Image,
-                         candidates: List[Dict]) -> List[Dict]:
+                         candidates: List[Dict],
+                         score_mode: str = '4ch') -> List[Dict]:
         """
         Args:
             bg:          Background PIL image (RGB).
             fg:          Foreground PIL image (RGB).
             fg_mask:     Foreground mask (L).
             candidates:  List of dicts from ``generate_candidates``.
+            score_mode:  '4ch' | '3ch' | 'crop'.
 
         Returns:
-            The same list with added keys:
-                ``score``     — float in [0, 1], higher = better.
-                ``composite`` — PIL Image of the composited result.
-                ``mask``      — PIL Image (L) of the foreground mask.
-            Sorted by score descending.
+            The same list with added keys, sorted by score descending.
         """
         results = []
         for cand in candidates:
             composite, mask = make_composite(bg, fg, fg_mask, cand['bbox'])
-            score = self.model.score(composite, mask)
+            score = self.model.score(composite, mask,
+                                     mode=score_mode, bbox=cand['bbox'])
             results.append({
                 **cand,
                 'score':     score,

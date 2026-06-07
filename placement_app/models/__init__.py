@@ -123,22 +123,68 @@ class SimOPAScorer:
         ])
 
     @torch.no_grad()
-    def score(self, composite: Image.Image, mask: Image.Image) -> float:
+    def score(self, composite: Image.Image, mask: Image.Image = None,
+              mode: str = '4ch', bbox: list = None) -> float:
         """
         Score a composite image + foreground mask.
 
         Args:
-            composite:  RGB composite image (any size, will be resized to 256²).
-            mask:       Greyscale mask (any size), 255 = foreground region.
+            composite:  RGB composite image.
+            mask:       Greyscale mask, 255 = foreground (needed for 4ch/crop modes).
+            mode:       Input variant:
+                '4ch'   — RGB + mask concatenated (default, original).
+                '3ch'   — RGB only, mask ignored.
+                'crop'  — Crop the region around ``bbox``, then score.
+                          Uses 4ch if ``mask`` is given, else 3ch.
+            bbox:       [x1, y1, x2, y2] for crop mode.
 
         Returns:
             Rationality score in [0, 1].  Higher → more reasonable placement.
         """
-        img_t = self._transform(composite.convert('RGB'))          # [3, 256, 256]
-        msk_t = self._transform(mask.convert('L'))                 # [1, 256, 256]
-        cat   = torch.cat([img_t, msk_t], dim=0).unsqueeze(0)     # [1, 4, 256, 256]
-        cat   = cat.to(self.device)
+        if mode == 'crop' and bbox is not None:
+            # Expand crop region by sqrt(2) for context
+            x1, y1, x2, y2 = bbox
+            w, h = x2 - x1, y2 - y1
+            add_w, add_h = int(w * 0.207), int(h * 0.207)
+            x1 = max(0, x1 - add_w)
+            y1 = max(0, y1 - add_h)
+            x2 = min(composite.width, x2 + add_w)
+            y2 = min(composite.height, y2 + add_h)
+            composite = composite.crop((x1, y1, x2, y2))
+            if mask is not None:
+                mask = mask.crop((x1, y1, x2, y2))
 
-        logits = self.model(cat)                                   # [1, 2]
-        prob   = F.softmax(logits, dim=-1)[0, 1].item()           # P(reasonable)
+        img_t = self._transform(composite.convert('RGB'))          # [3, 256, 256]
+
+        if mode == '3ch' or mask is None:
+            cat = img_t.unsqueeze(0).to(self.device)              # [1, 3, 256, 256]
+        else:
+            msk_t = self._transform(mask.convert('L'))            # [1, 256, 256]
+            cat = torch.cat([img_t, msk_t], dim=0).unsqueeze(0)   # [1, 4, 256, 256]
+        cat = cat.to(self.device)
+
+        if cat.shape[1] == 3:
+            logits = self._forward_3ch(cat)
+        else:
+            logits = self.model(cat)
+
+        prob = F.softmax(logits, dim=-1)[0, 1].item()
         return float(prob)
+
+    @torch.no_grad()
+    def _forward_3ch(self, img: torch.Tensor) -> torch.Tensor:
+        """Forward pass with 3-channel input, reusing 4ch conv1 weights."""
+        # conv1: use first 3 channels of the 4ch weight
+        conv1_w = self.model.backbone[0].weight  # [64, 4, 7, 7]
+        bn1 = self.model.backbone[1]
+        relu = self.model.backbone[2]
+        maxpool = self.model.backbone[3]
+
+        x = F.conv2d(img, conv1_w[:, :3], stride=2, padding=3)  # use 3ch only
+        x = relu(bn1(x))
+        x = maxpool(x)
+        # Rest of backbone
+        for layer in self.model.backbone[4:]:
+            x = layer(x)
+        feat = self.model.pool(x).flatten(1)
+        return self.model.prediction_head(feat)

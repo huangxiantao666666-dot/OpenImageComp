@@ -180,7 +180,8 @@ async def api_place(
             'rank': i + 1,
             'score_simopa': round(r['score'], 4),
             'score_topnet': round(r.get('topnet', 0), 4) if 'topnet' in r else None,
-            'bbox': r['bbox'],
+            'bbox': [r['bbox'][0]/bg_pil.width, r['bbox'][1]/bg_pil.height,
+                      r['bbox'][2]/bg_pil.width, r['bbox'][3]/bg_pil.height],
             'scale': round(r.get('scale', 1.0), 2),
             'image': _img_to_base64(comp, 'JPEG'),
         })
@@ -195,7 +196,9 @@ async def api_place(
         if method == 'topnet':
             row.append(f'{r.get("topnet", 0):.4f}')
         row.append(f'{r.get("scale", 1.0):.2f}')
-        row.append(f'({r["bbox"][0]},{r["bbox"][1]},{r["bbox"][2]},{r["bbox"][3]})')
+        b = r['bbox']
+        row.append(f'({b[0]/bg_pil.width:.2f},{b[1]/bg_pil.height:.2f},'
+                   f'{b[2]/bg_pil.width:.2f},{b[3]/bg_pil.height:.2f})')
         rows.append(row)
 
     return {
@@ -286,7 +289,8 @@ async def api_place_manual(
         'status': 'ok',
         'composite': _img_to_base64(comp, 'JPEG'),
         'score_simopa': round(simopa_score, 4),
-        'bbox': bbox,
+        'bbox': [bbox[0]/bg_pil.width, bbox[1]/bg_pil.height,
+                  bbox[2]/bg_pil.width, bbox[3]/bg_pil.height],
         'scale': round(scale, 1),
         'rotation': round(rotation, 1),
     }

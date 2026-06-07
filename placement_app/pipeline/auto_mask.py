@@ -147,12 +147,26 @@ def _cv_mask(fg_rgb: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 #  Public API
 # ---------------------------------------------------------------------------
+def _add_border(fg_rgb: np.ndarray, border_px: int = 20) -> np.ndarray:
+    """Pad image with black border to help segmentation on edge-touching objects."""
+    h, w = fg_rgb.shape[:2]
+    padded = np.zeros((h + 2*border_px, w + 2*border_px, 3), dtype=np.uint8)
+    padded[border_px:border_px+h, border_px:border_px+w] = fg_rgb
+    return padded
+
+
+def _crop_border(mask: np.ndarray, border_px: int = 20) -> np.ndarray:
+    """Crop back to original size after segmentation on padded image."""
+    return mask[border_px:mask.shape[0]-border_px, border_px:mask.shape[1]-border_px]
+
+
 def auto_mask(fg_rgb: np.ndarray, prefer_sam: bool = True) -> np.ndarray:
     """
     Generate a binary foreground mask.
 
-    Tries SAM 2.1 first (if available and ``prefer_sam=True``), falls back
-    to OpenCV border-colour + Otsu.
+    Pads the image with a black border before segmentation to improve
+    results on objects touching the image edge.  Tries SAM 2.1 first
+    (if available), falls back to OpenCV on failure.
 
     Args:
         fg_rgb:     numpy array [H, W, 3] uint8.
@@ -161,6 +175,21 @@ def auto_mask(fg_rgb: np.ndarray, prefer_sam: bool = True) -> np.ndarray:
     Returns:
         mask:  numpy array [H, W] uint8, 255 = foreground, 0 = background.
     """
+    border = 20
+    padded = _add_border(fg_rgb, border)
+
     if prefer_sam and _load_sam2():
-        return _sam2_mask(fg_rgb)
-    return _cv_mask(fg_rgb)
+        try:
+            mask_padded = _sam2_mask(padded)
+            fg_pct = (mask_padded > 127).sum() / mask_padded.size * 100
+            if fg_pct < 1.0 or fg_pct > 95.0:
+                print(f'[auto_mask] SAM2 unusual mask ({fg_pct:.1f}% fg), '
+                      f'falling back to OpenCV')
+                mask_padded = _cv_mask(padded)
+        except Exception as e:
+            print(f'[auto_mask] SAM2 failed ({e}), falling back to OpenCV')
+            mask_padded = _cv_mask(padded)
+    else:
+        mask_padded = _cv_mask(padded)
+
+    return _crop_border(mask_padded, border)
