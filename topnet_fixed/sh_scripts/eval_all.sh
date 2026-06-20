@@ -58,4 +58,16 @@ echo "=============================================="
 python "$DIR/eval_expC_focal_full_113M.py"
 
 echo ""
+echo "=============================================="
+echo " Exp A: CE + global MLP (fixed attention, 113M)"
+echo "=============================================="
+python "$DIR/eval_expA_ce_globalMLP.py"
+
+echo ""
+echo "=============================================="
+echo " Exp B: Focal partial + global MLP (113M)"
+echo "=============================================="
+python "$DIR/eval_expB_focal_globalMLP.py"
+
+echo ""
 echo "All evaluations done. Results in evaluate/logs/"

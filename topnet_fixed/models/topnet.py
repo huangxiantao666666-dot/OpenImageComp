@@ -174,26 +174,40 @@ def _build_fg_encoder():
 class _TransformerModule(nn.Module):
     """Fixed: correct LayerNorm dim + batch_first MHA."""
 
-    def __init__(self, embed_dim=1024, num_heads=8, mlp_expansion=4):
+    def __init__(self, embed_dim=1024, num_heads=8, mlp_expansion=4,
+                 use_global_mlp=False):
         """
         Args:
-            embed_dim:     Feature dimension (1024).
-            num_heads:     Attention heads (8).
-            mlp_expansion: MLP hidden = embed_dim * mlp_expansion.
-                           4 = 79M model, 8 = 113M model.
+            embed_dim:      Feature dimension (1024).
+            num_heads:      Attention heads (8).
+            mlp_expansion:  For per-token MLP: hidden = embed_dim * mlp_expansion.
+            use_global_mlp: If True, use the original buggy-style global MLP
+                            (flatten 1024x8x8 → 128 bottleneck → 1024x8x8).
+                            ~113M params regardless of mlp_expansion.
         """
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn  = nn.MultiheadAttention(embed_dim, num_heads,
                                            batch_first=True)
         self.norm2 = nn.LayerNorm(embed_dim)
+        self.use_global_mlp = use_global_mlp
 
-        hidden = embed_dim * mlp_expansion
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, embed_dim),
-        )
+        if use_global_mlp:
+            spatial_dim = 1024 * 8 * 8  # 65536
+            self.mlp = nn.Sequential(
+                nn.Linear(spatial_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, spatial_dim),
+            )
+        else:
+            hidden = embed_dim * mlp_expansion
+            self.mlp = nn.Sequential(
+                nn.Linear(embed_dim, hidden),
+                nn.GELU(),
+                nn.Linear(hidden, embed_dim),
+            )
 
     def forward(self, x):
         """
@@ -214,19 +228,26 @@ class _TransformerModule(nn.Module):
         tokens = tokens + attn_out
 
         # MLP with pre-norm
-        tokens = tokens + self.mlp(self.norm2(tokens))        # [B, 64, 1024]
-
-        # Reshape back: [B, H*W, C] → [B, C, H, W]
-        x = tokens.transpose(1, 2).view(B, C, H, W)
+        if self.use_global_mlp:
+            # Global MLP: LayerNorm on feature dim → flatten → bottleneck → reshape
+            x_n = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            flat = x_n.flatten(1)                              # [B, 65536]
+            mlp_out = self.mlp(flat)                           # [B, 65536]
+            x = x + mlp_out.view(B, C, H, W)                   # [B, 1024, 8, 8]
+        else:
+            # Per-token MLP
+            tokens = tokens + self.mlp(self.norm2(tokens))     # [B, 64, 1024]
+            x = tokens.transpose(1, 2).view(B, C, H, W)       # [B, 1024, 8, 8]
         return x
 
 
 class _Transformer(nn.Module):
     def __init__(self, embed_dim=1024, num_heads=8, num_layers=4,
-                 mlp_expansion=4):
+                 mlp_expansion=4, use_global_mlp=False):
         super().__init__()
         self.layers = nn.ModuleList([
-            _TransformerModule(embed_dim, num_heads, mlp_expansion)
+            _TransformerModule(embed_dim, num_heads, mlp_expansion,
+                               use_global_mlp)
             for _ in range(num_layers)
         ])
 
@@ -257,11 +278,13 @@ class ObPlaNet_resnet18(nn.Module):
     Total params: ~113M (original) / reduced with per-token MLP.
     """
 
-    def __init__(self, out_channels: int = 2, mlp_expansion: int = 4):
+    def __init__(self, out_channels: int = 2, mlp_expansion: int = 4,
+                 use_global_mlp: bool = False):
         """
         Args:
-            out_channels:  2 = binary classifier, 1 = keypoint heatmap.
-            mlp_expansion: 4 = 79M model, 8 = 113M model.
+            out_channels:   2 = binary classifier, 1 = keypoint heatmap.
+            mlp_expansion:  4 = 79M model, 8 = 113M model (per-token).
+            use_global_mlp: If True, buggy-style global MLP (~113M params).
         """
         super().__init__()
         self.out_channels = out_channels
@@ -277,7 +300,7 @@ class ObPlaNet_resnet18(nn.Module):
         # ---- Transformer (FIXED) ----
         self.transformer = _Transformer(
             embed_dim=1024, num_heads=8, num_layers=4,
-            mlp_expansion=mlp_expansion)
+            mlp_expansion=mlp_expansion, use_global_mlp=use_global_mlp)
 
         # ---- UNet Decoder ----
         self.upconv32 = BasicConv2d(1024, 512, kernel_size=3, stride=1, padding=1)
@@ -345,8 +368,9 @@ class ObPlaNet_resnet18(nn.Module):
 class ObPlaNet_resnet18_keypoint(ObPlaNet_resnet18):
     """Keypoint-detection variant: output [B, 1, H, W] heatmap with Sigmoid."""
 
-    def __init__(self, mlp_expansion: int = 4):
-        super().__init__(out_channels=1, mlp_expansion=mlp_expansion)
+    def __init__(self, mlp_expansion: int = 4, use_global_mlp: bool = False):
+        super().__init__(out_channels=1, mlp_expansion=mlp_expansion,
+                          use_global_mlp=use_global_mlp)
 
 
 # ======================================================================
@@ -364,12 +388,17 @@ def build_model(name: str, **kwargs) -> nn.Module:
     Args:
         name:   'ObPlaNet_resnet18' (2ch),
                 'ObPlaNet_resnet18_keypoint' (1ch).
-                Append '_113M' suffix for mlp_expansion=8 version.
+                Suffix '_113M' for mlp_expansion=8.
+                Suffix '_globalMLP' for buggy-style global MLP (~113M).
         kwargs: passed to the model constructor.
 
     Returns:
         nn.Module instance.
     """
+    if name.endswith('_globalMLP'):
+        base = name.replace('_globalMLP', '')
+        kwargs.setdefault('use_global_mlp', True)
+        name = base
     if name.endswith('_113M'):
         base = name.replace('_113M', '')
         kwargs.setdefault('mlp_expansion', 8)

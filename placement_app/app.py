@@ -632,11 +632,24 @@ def build_ui():
                                                     object_fit='contain', height=420)
                             with gr.Tab('Detail Table'):
                                 tbl_u = gr.Dataframe(label='Scores')
+                            with gr.Tab('Interpretation'):
+                                with gr.Tabs():
+                                    with gr.Tab('Grad-CAM'):
+                                        ui_gc = gr.Image(label='Grad-CAM', type='pil', height=300)
+                                    with gr.Tab('Saliency'):
+                                        ui_sal = gr.Image(label='Saliency', type='pil', height=300)
+                                    with gr.Tab('Occlusion'):
+                                        ui_occ = gr.Image(label='Occlusion', type='pil', height=300)
+                                    with gr.Tab('Features L2'):
+                                        ui_f2 = gr.Image(label='Layer2', type='pil', height=300)
+                                    with gr.Tab('Features L4'):
+                                        ui_f4 = gr.Image(label='Layer4', type='pil', height=300)
 
-                btn_u.click(analyze,
-                            [u_bg, u_fg, u_mask, u_method,
-                             u_grid, u_scales, u_tn_scale, u_harmony, u_mask_src, u_score_m],
-                            [hm_u, gal_u, tbl_u, status_u])
+                btn_u.click(
+                    lambda *args: _unpack_interp(*analyze(*args)),
+                    [u_bg, u_fg, u_mask, u_method,
+                     u_grid, u_scales, u_tn_scale, u_harmony, u_mask_src, u_score_m],
+                    [hm_u, gal_u, tbl_u, ui_gc, ui_sal, ui_occ, ui_f2, ui_f4, status_u])
 
             # ============================================================
             #  Tab 3: Manual Placement

@@ -21,8 +21,12 @@ OPA/dataset/
 topnet_fixed/data/data/
 !topnet_fixed/data/*.py
 
-# Android app (teammate handles builds)
-ImageCompApp/
+# Android build artifacts
+ImageCompApp/.gradle/
+ImageCompApp/app/build/
+ImageCompApp/.idea/
+ImageCompApp/*.iml
+.gradle/
 
 # Python
 __pycache__/

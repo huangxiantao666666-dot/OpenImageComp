@@ -201,6 +201,8 @@ def main():
     parser.add_argument('--expC_ckpt', default='./checkpoints/expC_focal_full/stage2_best.pth')
     parser.add_argument('--expB113M_ckpt', default='./checkpoints/expB_focal_113M/stage2_best.pth')
     parser.add_argument('--expC113M_ckpt', default='./checkpoints/expC_focal_full_113M/stage2_best.pth')
+    parser.add_argument('--expA_globalMLP_ckpt', default='./checkpoints/expA_ce_globalMLP/stage2_best.pth')
+    parser.add_argument('--expB_globalMLP_ckpt', default='./checkpoints/expB_focal_globalMLP/stage2_best.pth')
     parser.add_argument('--quick', action='store_true',
                         help='Only evaluate on first 4 batches (fast check)')
     parser.add_argument('--batch_size', type=int, default=32)
@@ -326,8 +328,37 @@ def main():
         r['params'] = n
         r['type'] = 'fixed_Focal_full_113M'
         results['expC_focal_full_113M'] = r
+        _cleanup(m)
     else:
         print(f'\n[Skipping] Exp C 113M not found: {args.expC113M_ckpt}')
+
+    # Exp A globalMLP
+    if os.path.exists(args.expA_globalMLP_ckpt):
+        print('\n--- Exp A (globalMLP): Sparse CE ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18_globalMLP',
+                                     args.expA_globalMLP_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=False,
+                     model_name='Exp A globalMLP', quick=args.quick)
+        r['params'] = n
+        r['type'] = 'fixed_CE_globalMLP'
+        results['expA_CE_globalMLP'] = r
+        _cleanup(m)
+    else:
+        print(f'\n[Skipping] Exp A globalMLP not found: {args.expA_globalMLP_ckpt}')
+
+    # Exp B globalMLP
+    if os.path.exists(args.expB_globalMLP_ckpt):
+        print('\n--- Exp B (globalMLP): Partial Focal ---')
+        m, n, kp = load_fixed_model('ObPlaNet_resnet18_keypoint_globalMLP',
+                                     args.expB_globalMLP_ckpt, device)
+        r = evaluate(m, test_loader, device, is_keypoint=kp,
+                     model_name='Exp B globalMLP', quick=args.quick)
+        r['params'] = n
+        r['type'] = 'fixed_Focal_partial_globalMLP'
+        results['expB_focal_globalMLP'] = r
+        _cleanup(m)
+    else:
+        print(f'\n[Skipping] Exp B globalMLP not found: {args.expB_globalMLP_ckpt}')
 
     # ---- Summary ----
     print('\n' + '=' * 75)
