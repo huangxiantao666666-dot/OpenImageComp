@@ -55,6 +55,9 @@ events.out.tfevents.*
 .DS_Store
 Thumbs.db
 
+# Videos
+videos/
+
 # Misc
 *.swp
 *.swo
